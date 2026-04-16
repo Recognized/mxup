@@ -447,4 +447,4 @@ module Mxup
   end
 end
 
-Mxup::CLI.new.run(ARGV)
+Mxup::CLI.new.run(ARGV) if __FILE__ == $PROGRAM_NAME

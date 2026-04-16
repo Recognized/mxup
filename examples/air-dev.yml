@@ -1,0 +1,49 @@
+# Example: AIR local development stack
+#
+# Place your copy at ~/.config/mxup/air-dev.yml, then:
+#   mxup up air-dev
+#   mxup status air-dev
+#   mxup restart air-dev:air-backend
+#   mxup down air-dev
+#
+# Parameterize via env vars:
+#   DOCKER_PROFILES=agentic-core DOCKER_LOCAL=air-backend mxup up air-dev
+
+session: air-dev
+
+setup: |
+  direnv allow . 2>/dev/null
+  eval "$(direnv export zsh 2>/dev/null)"
+
+windows:
+  docker:
+    root: ~/IdeaProjects/jcp-all/docker/cli
+    command: >-
+      node index.js up
+      --profiles=${DOCKER_PROFILES:-agentic-core,ai-management,secrets}
+      --local=${DOCKER_LOCAL:-agent-spawner,air-backend}
+
+  air-backend:
+    root: ~/IdeaProjects/jcp-air/cloud/backend
+    wait_for: localhost:5432
+    command: ./gradlew run
+
+  agent-spawner:
+    root: ~/IdeaProjects/jcp-agent-spawner
+    wait_for: localhost:5432
+    env:
+      JCP_CONFIG_RESOURCE: /application-local-dev.conf
+      SPAWNER_SERVICE_IDENTITIES__EXTERNAL__TOKEN_URL: http://authn.docker.localhost/api/rest/oauth2/token
+      SPAWNER_SERVICE_IDENTITIES__EXTERNAL__SERVICE_SECRET: jcp-agent-spawner
+    command: ./gradlew :run
+
+  air-frontend:
+    root: ~/IdeaProjects/jcp-air/cloud/frontend
+    command: pnpm run dev
+
+  dev-kit:
+    root: ~/IdeaProjects/jcp-air/cloud/frontend
+    command: npx @jcp/platform-dev-kit --profile=local,dev
+
+  scratch:
+    root: ~/IdeaProjects/jcp-air

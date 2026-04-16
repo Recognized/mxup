@@ -28,8 +28,12 @@ mxup up air-dev
 # Check what's running
 mxup status air-dev
 
-# Restart a single window
+# Restart specific windows
 mxup restart air-dev:air-backend
+mxup restart air-dev:air-backend,agent-spawner
+
+# Restart all windows
+mxup restart air-dev
 
 # Tear everything down
 mxup down air-dev
@@ -105,14 +109,15 @@ APP_ENV=production mxup up my-project
 | `mxup up [name]` | Reconcile session to match config (default when no subcommand) |
 | `mxup status [name]` | Show per-window status with recent output |
 | `mxup down [name]` | Kill the session |
-| `mxup restart [name:]<window>` | Restart a specific window |
+| `mxup restart [name:]<w1,w2,...>` | Restart specific window(s) (comma-separated) |
+| `mxup restart [name]` | Restart all windows in the session |
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `-f path` | Use a specific config file |
-| `--dry-run` | Preview reconciliation without making changes (for `up`) |
+| `--dry-run` | Preview changes without applying (for `up` and `restart`) |
 | `--lines N` | Number of output lines to show per window (for `status`, default 15) |
 
 ## Reconciliation

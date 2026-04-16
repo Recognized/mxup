@@ -190,34 +190,39 @@ module Mxup
       end
     end
 
-    def restart(window_name)
-      win = @config.windows.find { |w| w.name == window_name }
-      unless win
-        abort "Window '#{window_name}' not found in config."
-      end
-      unless Tmux.has_session?(@session)
-        abort "Session #{@session} is not running."
-      end
+    def restart(window_names)
+      abort "Session #{@session} is not running." unless Tmux.has_session?(@session)
+
+      targets = if window_names.nil? || window_names.empty?
+                  @config.windows
+                else
+                  window_names.flat_map { |n| n.split(',') }.map do |n|
+                    @config.windows.find { |w| w.name == n } ||
+                      abort("Window '#{n}' not found in config.")
+                  end
+                end
 
       existing = Tmux.list_windows(@session).map { |w| w[:name] }
-      if existing.include?(window_name)
-        if @dry_run
-          puts "[dry-run] Would restart #{window_name}"
+
+      targets.each do |win|
+        if existing.include?(win.name)
+          if @dry_run
+            puts "[dry-run] Would restart #{win.name}"
+          else
+            Tmux.send_interrupt(@session, win.name)
+            sleep 1
+            Tmux.send_interrupt(@session, win.name)
+            sleep 1
+            Tmux.send_keys(@session, win.name, assemble_command(win))
+            puts "  #{win.name}: restarted"
+          end
         else
-          puts "Restarting #{window_name}..."
-          Tmux.send_interrupt(@session, window_name)
-          sleep 1
-          Tmux.send_interrupt(@session, window_name)
-          sleep 1
-          Tmux.send_keys(@session, window_name, assemble_command(win))
-          puts "  #{window_name}: restarted"
-        end
-      else
-        if @dry_run
-          puts "[dry-run] Would create #{window_name}"
-        else
-          create_window(win)
-          puts "  #{window_name}: created"
+          if @dry_run
+            puts "[dry-run] Would create #{win.name}"
+          else
+            create_window(win)
+            puts "  #{win.name}: created"
+          end
         end
       end
     end
@@ -374,16 +379,27 @@ module Mxup
 
       case command
       when 'restart'
-        target = args.shift || abort('Usage: mxup restart [session:]<window>')
-        if target.include?(':')
-          name, window = target.split(':', 2)
+        target = args.shift
+        if target&.include?(':')
+          name, windows_str = target.split(':', 2)
+          window_names = windows_str ? windows_str.split(',') : []
+        elsif target
+          # Could be a session name (followed by window args) or a window name
+          candidate = File.join(CONFIG_DIR, "#{target}.yml")
+          if File.exist?(candidate) || (options[:config] && target !~ /,/)
+            name = target
+            window_names = args
+          else
+            name = nil
+            window_names = [target] + args
+          end
         else
-          window = target
           name = nil
+          window_names = []
         end
         config = load_config(options[:config], name)
         runner = Runner.new(config, dry_run: options[:dry_run])
-        runner.restart(window)
+        runner.restart(window_names)
 
       when 'up', 'status', 'down'
         name = args.shift

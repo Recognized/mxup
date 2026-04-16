@@ -102,6 +102,52 @@ Then override at invocation:
 APP_ENV=production mxup up my-project
 ```
 
+### Layouts
+
+Define multiple named layouts to control how windows are grouped as tmux panes:
+
+```yaml
+layouts:
+  full:
+    services:
+      panes: [database, backend]
+      split: even-horizontal
+    frontend:
+      panes: [frontend]
+
+  compact:
+    all:
+      panes: [database, backend, frontend]
+      split: tiled
+
+  flat: {}
+```
+
+Each layout is a map of **group names** to group definitions. Windows in a group share a single tmux window as split panes. Windows not mentioned in any group remain standalone.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `layouts` | no | Map of named layout definitions |
+
+Per group:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `panes` | yes | List of window names to group as panes |
+| `split` | no | tmux layout: `even-horizontal`, `even-vertical`, `main-horizontal`, `main-vertical`, `tiled` (default: `tiled`) |
+
+The first layout is used by default. Override with `--layout`:
+
+```bash
+mxup up my-project --layout=compact
+```
+
+Switch layouts on a running session without killing processes:
+
+```bash
+mxup layout my-project compact
+```
+
 ## Commands
 
 | Command | Description |
@@ -111,6 +157,8 @@ APP_ENV=production mxup up my-project
 | `mxup down [name]` | Kill the session |
 | `mxup restart [name:]<w1,w2,...>` | Restart specific window(s) (comma-separated) |
 | `mxup restart [name]` | Restart all windows in the session |
+| `mxup layout [name]` | Show available layouts and which is active |
+| `mxup layout [name] <layout>` | Switch to a different layout (preserves running processes) |
 
 ### Flags
 
@@ -119,6 +167,7 @@ APP_ENV=production mxup up my-project
 | `-f path` | Use a specific config file |
 | `--dry-run` | Preview changes without applying (for `up` and `restart`) |
 | `--lines N` | Number of output lines to show per window (for `status`, default 15) |
+| `--layout NAME` | Layout to use (for `up`) |
 
 ## Reconciliation
 
@@ -128,6 +177,7 @@ APP_ENV=production mxup up my-project
 - **Extra windows** → killed (with warning)
 - **Idle/crashed windows** (shell prompt visible) → command re-sent
 - **Healthy running windows** → left untouched
+- **Layout changed** → panes rearranged without killing processes
 
 ## License
 

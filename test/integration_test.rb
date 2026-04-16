@@ -37,16 +37,20 @@ class IntegrationTest < Minitest::Test
     Mxup::Tmux.list_windows(SESSION).map { |w| w[:name] }
   end
 
-  def pane_fg(window)
+  def pane_fg(window, pane_index: nil)
     panes = Mxup::Tmux.list_panes(SESSION)
-    pane = panes.find { |p| p[:name] == window }
+    pane = if pane_index
+             panes.find { |p| p[:name] == window && p[:pane_index] == pane_index }
+           else
+             panes.find { |p| p[:name] == window }
+           end
     pane&.dig(:fg_cmd)
   end
 
-  def wait_for_process(window, expected_fg, timeout: 5)
+  def wait_for_process(window, expected_fg, timeout: 5, pane_index: nil)
     deadline = Time.now + timeout
     loop do
-      fg = pane_fg(window)
+      fg = pane_fg(window, pane_index: pane_index)
       return fg if fg == expected_fg || Time.now > deadline
       sleep 0.3
     end
@@ -76,7 +80,7 @@ class IntegrationTest < Minitest::Test
     assert_includes out, 'alpha: created'
     assert_includes out, 'beta: created'
 
-    wait_for_process('alpha', 'sleep')
+    wait_for_process('alpha', 'sleep', timeout: 10)
     assert_equal 'sleep', pane_fg('alpha')
   end
 
@@ -191,6 +195,26 @@ class IntegrationTest < Minitest::Test
     assert Mxup::Tmux.has_session?(SESSION)
 
     capture_io { runner.down }
+    refute Mxup::Tmux.has_session?(SESSION)
+  end
+
+  def test_down_sends_interrupt_before_killing
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        w:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+
+    capture_io { runner.up }
+    wait_for_process('w', 'sleep')
+
+    out, = capture_io { runner.down }
+    assert_includes out, 'Stopping session'
     refute Mxup::Tmux.has_session?(SESSION)
   end
 
@@ -443,5 +467,370 @@ class IntegrationTest < Minitest::Test
       .map { |w| w[:name] }
 
     assert_equal %w[first second third], names
+  end
+
+  # --- Layouts: pane groups ---
+
+  def test_up_creates_pane_group
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+        c:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    assert Mxup::Tmux.has_session?(SESSION)
+    names = window_names
+    assert_includes names, 'main'
+    assert_includes names, 'c'
+    refute_includes names, 'a'
+    refute_includes names, 'b'
+
+    assert_equal 2, Mxup::Tmux.pane_count(SESSION, 'main')
+  end
+
+  def test_pane_titles_set_on_group
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    panes = Mxup::Tmux.list_panes(SESSION).select { |p| p[:name] == 'main' }
+      .sort_by { |p| p[:pane_index] }
+    assert_equal 'a', panes[0][:title]
+    assert_equal 'b', panes[1][:title]
+  end
+
+  def test_layout_stored_in_environment
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a]
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    assert_equal 'full', Mxup::Tmux.show_environment(SESSION, 'MXUP_LAYOUT')
+  end
+
+  def test_up_with_flat_layout_creates_standalone_windows
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        grouped:
+          main:
+            panes: [a, b]
+        flat: {}
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config, layout: 'flat')
+    capture_io { runner.up }
+
+    names = window_names
+    assert_includes names, 'a'
+    assert_includes names, 'b'
+    refute_includes names, 'main'
+  end
+
+  # --- Layout switching ---
+
+  def test_switch_layout_preserves_pids
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+        c:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        grouped:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+        flat: {}
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config, layout: 'grouped')
+    capture_io { runner.up }
+
+    sleep 1
+    panes_before = Mxup::Tmux.list_panes(SESSION)
+    pids_before = panes_before.map { |p| p[:pid] }.sort
+
+    runner_switch = Mxup::Runner.new(config, layout: 'flat')
+    capture_io { runner_switch.switch_layout('flat') }
+
+    panes_after = Mxup::Tmux.list_panes(SESSION)
+    pids_after = panes_after.map { |p| p[:pid] }.sort
+
+    assert_equal pids_before, pids_after, "PIDs should survive layout switch"
+    names = window_names
+    assert_includes names, 'a'
+    assert_includes names, 'b'
+    assert_includes names, 'c'
+  end
+
+  def test_switch_layout_regroups_panes
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+        c:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        flat: {}
+        compact:
+          all:
+            panes: [a, b, c]
+            split: tiled
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config, layout: 'flat')
+    capture_io { runner.up }
+
+    sleep 1
+    assert_equal 3, window_names.size
+
+    runner_switch = Mxup::Runner.new(config, layout: 'compact')
+    capture_io { runner_switch.switch_layout('compact') }
+
+    names = window_names
+    assert_includes names, 'all'
+    assert_equal 3, Mxup::Tmux.pane_count(SESSION, 'all')
+  end
+
+  def test_switch_layout_already_active
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a]
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.switch_layout('full') }
+    assert_includes out, "Already using layout 'full'"
+  end
+
+  # --- Reconcile with layout ---
+
+  def test_reconcile_restarts_idle_pane_in_group
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    wait_for_process('main', 'sleep', pane_index: 0)
+    wait_for_process('main', 'sleep', pane_index: 1)
+
+    Mxup::Tmux.send_interrupt(SESSION, Mxup::Tmux.pane_target('main', 0))
+    sleep 1
+
+    out, = capture_io { runner.up }
+    assert_includes out, 'a: restarted (was idle)'
+    assert_includes out, 'b: running (sleep)'
+  end
+
+  # --- Restart with layout ---
+
+  def test_restart_targets_pane_in_group
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 1
+
+    out, = capture_io { runner.restart(['a']) }
+    assert_includes out, 'a: restarted'
+    refute_includes out, 'b'
+  end
+
+  # --- Show layouts ---
+
+  def test_show_layouts
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+        flat: {}
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+
+    out, = capture_io { runner.show_layouts }
+    assert_includes out, 'full'
+    assert_includes out, 'flat'
+    assert_includes out, 'main=[a,b]'
+    assert_includes out, 'all standalone'
+  end
+
+  # --- Status with layout ---
+
+  def test_status_shows_layout_info
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 2
+
+    out, = capture_io { runner.status(lines: 5) }
+    assert_includes out, 'layout: full'
+    assert_includes out, 'main'
+    assert_includes out, 'a, b'
+  end
+
+  # --- Window ordering with layout ---
+
+  def test_window_order_with_layout
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: /tmp
+          command: sleep 600
+        b:
+          root: /tmp
+          command: sleep 600
+        c:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    names = Mxup::Tmux.list_windows(SESSION)
+      .sort_by { |w| w[:index] }
+      .map { |w| w[:name] }
+
+    assert_equal %w[main c], names
   end
 end

@@ -341,3 +341,267 @@ class ShellDetectionTest < Minitest::Test
     end
   end
 end
+
+class LayoutConfigTest < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir
+  end
+
+  def teardown
+    FileUtils.rm_rf(@dir)
+  end
+
+  def write_config(content)
+    path = File.join(@dir, 'test.yml')
+    File.write(path, content)
+    path
+  end
+
+  def test_no_layouts_returns_empty
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+    YAML
+    config = Mxup::Config.new(path)
+    assert_equal({}, config.layouts)
+    assert_equal([], config.layout_names)
+    assert_nil config.default_layout
+  end
+
+  def test_parses_single_layout
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+    YAML
+    config = Mxup::Config.new(path)
+    assert_equal ['full'], config.layout_names
+    assert_equal 'full', config.default_layout
+
+    groups = config.groups_for('full')
+    assert_equal 1, groups.size
+    assert_equal 'main', groups.first.name
+    assert_equal %w[a b], groups.first.window_names
+    assert_equal 'even-horizontal', groups.first.split
+  end
+
+  def test_parses_multiple_layouts
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+        c:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+        compact:
+          all:
+            panes: [a, b, c]
+            split: tiled
+        flat: {}
+    YAML
+    config = Mxup::Config.new(path)
+    assert_equal %w[full compact flat], config.layout_names
+    assert_equal 'full', config.default_layout
+
+    assert_equal 1, config.groups_for('full').size
+    assert_equal 1, config.groups_for('compact').size
+    assert_equal 0, config.groups_for('flat').size
+  end
+
+  def test_split_defaults_to_tiled
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+      layouts:
+        default:
+          main:
+            panes: [a, b]
+    YAML
+    config = Mxup::Config.new(path)
+    assert_equal 'tiled', config.groups_for('default').first.split
+  end
+
+  def test_invalid_window_reference_raises
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, nonexistent]
+    YAML
+    assert_raises(ArgumentError) { Mxup::Config.new(path) }
+  end
+
+  def test_duplicate_window_in_groups_raises
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+      layouts:
+        full:
+          g1:
+            panes: [a]
+          g2:
+            panes: [a, b]
+    YAML
+    assert_raises(ArgumentError) { Mxup::Config.new(path) }
+  end
+
+  def test_groups_for_nil_returns_empty
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a]
+    YAML
+    config = Mxup::Config.new(path)
+    assert_equal [], config.groups_for(nil)
+  end
+
+  def test_effective_window_order_with_layout
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+        c:
+          root: /tmp
+        d:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+            split: even-horizontal
+          side:
+            panes: [c]
+    YAML
+    config = Mxup::Config.new(path)
+    order = config.effective_window_order('full')
+
+    assert_equal 3, order.size
+    assert_equal :group, order[0][:type]
+    assert_equal 'main', order[0][:name]
+    assert_equal :group, order[1][:type]
+    assert_equal 'side', order[1][:name]
+    assert_equal :standalone, order[2][:type]
+    assert_equal 'd', order[2][:name]
+  end
+
+  def test_effective_window_order_without_layout
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+    YAML
+    config = Mxup::Config.new(path)
+    order = config.effective_window_order(nil)
+
+    assert_equal 2, order.size
+    assert_equal :standalone, order[0][:type]
+    assert_equal 'a', order[0][:name]
+    assert_equal :standalone, order[1][:type]
+    assert_equal 'b', order[1][:name]
+  end
+
+  def test_effective_window_order_flat_layout
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+      layouts:
+        flat: {}
+    YAML
+    config = Mxup::Config.new(path)
+    order = config.effective_window_order('flat')
+
+    assert_equal 2, order.size
+    assert order.all? { |e| e[:type] == :standalone }
+  end
+
+  def test_find_group_for_window
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        a:
+          root: /tmp
+        b:
+          root: /tmp
+        c:
+          root: /tmp
+      layouts:
+        full:
+          main:
+            panes: [a, b]
+    YAML
+    config = Mxup::Config.new(path)
+
+    group, idx = config.find_group_for_window('full', 'a')
+    assert_equal 'main', group.name
+    assert_equal 0, idx
+
+    group, idx = config.find_group_for_window('full', 'b')
+    assert_equal 'main', group.name
+    assert_equal 1, idx
+
+    assert_nil config.find_group_for_window('full', 'c')
+  end
+
+  def test_window_by_name
+    path = write_config(<<~YAML)
+      session: s
+      windows:
+        alpha:
+          root: /tmp
+          command: echo hi
+        beta:
+          root: /tmp
+    YAML
+    config = Mxup::Config.new(path)
+
+    assert_equal 'alpha', config.window_by_name('alpha').name
+    assert_equal 'echo hi', config.window_by_name('alpha').command
+    assert_nil config.window_by_name('nonexistent')
+  end
+end

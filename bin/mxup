@@ -5,6 +5,7 @@ require 'yaml'
 require 'socket'
 require 'optparse'
 require 'shellwords'
+require 'set'
 
 module Mxup
   VERSION = '0.1.0'
@@ -12,13 +13,46 @@ module Mxup
   SHELLS = %w[zsh bash sh fish dash].freeze
 
   class Config
-    attr_reader :session, :setup, :windows
+    attr_reader :session, :setup, :windows, :layouts, :layout_names
 
     def initialize(path)
       raw = YAML.safe_load(File.read(path), permitted_classes: [Symbol])
       @session = raw.fetch('session')
       @setup = raw['setup']&.strip
       @windows = parse_windows(raw.fetch('windows'))
+      @layouts, @layout_names = parse_layouts(raw['layouts'])
+    end
+
+    def default_layout
+      @layout_names.first
+    end
+
+    def groups_for(layout_name)
+      return [] if layout_name.nil?
+      @layouts.fetch(layout_name)
+    end
+
+    def effective_window_order(layout_name)
+      groups = groups_for(layout_name)
+      grouped = groups.flat_map(&:window_names).to_set
+      order = []
+      groups.each { |g| order << { type: :group, name: g.name, group: g } }
+      @windows.each do |w|
+        order << { type: :standalone, name: w.name } unless grouped.include?(w.name)
+      end
+      order
+    end
+
+    def window_by_name(name)
+      @windows.find { |w| w.name == name }
+    end
+
+    def find_group_for_window(layout_name, window_name)
+      groups_for(layout_name).each do |g|
+        idx = g.window_names.index(window_name)
+        return [g, idx] if idx
+      end
+      nil
     end
 
     private
@@ -35,9 +69,43 @@ module Mxup
         )
       end
     end
+
+    def parse_layouts(raw)
+      return [{}, []] if raw.nil?
+      window_names_set = @windows.map(&:name).to_set
+      layouts = {}
+      order = []
+
+      raw.each do |layout_name, groups_hash|
+        order << layout_name
+        groups_hash ||= {}
+        seen = Set.new
+        groups = []
+
+        groups_hash.each do |group_name, group_opts|
+          group_opts ||= {}
+          pane_names = Array(group_opts['panes'])
+          pane_names.each do |pn|
+            raise ArgumentError, "Layout '#{layout_name}': window '#{pn}' not found in windows" unless window_names_set.include?(pn)
+            raise ArgumentError, "Layout '#{layout_name}': window '#{pn}' appears in multiple groups" if seen.include?(pn)
+            seen << pn
+          end
+          groups << PaneGroup.new(
+            name: group_name,
+            window_names: pane_names,
+            split: group_opts['split'] || 'tiled'
+          )
+        end
+
+        layouts[layout_name] = groups
+      end
+
+      [layouts, order]
+    end
   end
 
   Window = Struct.new(:name, :root, :command, :env, :wait_for, keyword_init: true)
+  PaneGroup = Struct.new(:name, :window_names, :split, keyword_init: true)
 
   module Tmux
     module_function
@@ -57,11 +125,12 @@ module Mxup
     end
 
     def list_panes(session)
-      `tmux list-panes -t #{esc(session)} -s -F '\#{window_index}|\#{window_name}|\#{pane_pid}|\#{pane_current_path}|\#{pane_current_command}'`
+      `tmux list-panes -t #{esc(session)} -s -F '\#{window_index}|\#{window_name}|\#{pane_index}|\#{pane_pid}|\#{pane_current_path}|\#{pane_current_command}|\#{pane_title}'`
         .strip.split("\n")
         .map do |l|
-          idx, name, pid, cwd, fg = l.split('|', 5)
-          { index: idx.to_i, name: name, pid: pid.to_i, cwd: cwd, fg_cmd: fg }
+          win_idx, name, pane_idx, pid, cwd, fg, title = l.split('|', 7)
+          { window_index: win_idx.to_i, name: name, pane_index: pane_idx.to_i,
+            pid: pid.to_i, cwd: cwd, fg_cmd: fg, title: title.to_s }
         end
     end
 
@@ -73,6 +142,40 @@ module Mxup
       system("tmux new-window -t #{esc(session)} -n #{esc(name)} -c #{esc(root)}")
     end
 
+    def split_window(session, window, root)
+      system("tmux split-window -t #{esc(session)}:#{esc(window)} -c #{esc(root)} -d")
+    end
+
+    def select_layout(session, window, layout)
+      system("tmux select-layout -t #{esc(session)}:#{esc(window)} #{esc(layout)}")
+    end
+
+    def join_pane(session, src_window, dst_window)
+      system("tmux join-pane -s #{esc(session)}:#{esc(src_window)} -t #{esc(session)}:#{esc(dst_window)} -d")
+    end
+
+    def break_pane(session, window, pane_index, new_window_name)
+      system("tmux break-pane -s #{esc(session)}:#{esc(window)}.#{pane_index} -n #{esc(new_window_name)} -d")
+    end
+
+    def rename_window(session, old_name, new_name)
+      system("tmux rename-window -t #{esc(session)}:#{esc(old_name)} #{esc(new_name)}")
+    end
+
+    def set_pane_title(session, window, pane_index, title)
+      system("tmux select-pane -t #{esc(session)}:#{esc(window)}.#{pane_index} -T #{esc(title)}")
+    end
+
+    def set_environment(session, key, value)
+      system("tmux set-environment -t #{esc(session)} #{esc(key)} #{esc(value)}")
+    end
+
+    def show_environment(session, key)
+      out = `tmux show-environment -t #{esc(session)} #{esc(key)} 2>/dev/null`.strip
+      return nil if out.empty? || out.start_with?('-')
+      out.split('=', 2).last
+    end
+
     def kill_window(session, name)
       system("tmux kill-window -t #{esc(session)}:#{esc(name)}")
     end
@@ -81,12 +184,16 @@ module Mxup
       system("tmux kill-session -t #{esc(name)}")
     end
 
-    def send_keys(session, window, keys)
-      system("tmux send-keys -t #{esc(session)}:#{esc(window)} #{esc(keys)} Enter")
+    def send_keys(session, target, keys)
+      system("tmux send-keys -t #{esc(session)}:#{esc(target)} #{esc(keys)} Enter")
     end
 
-    def send_interrupt(session, window)
-      system("tmux send-keys -t #{esc(session)}:#{esc(window)} C-c")
+    def send_interrupt(session, target)
+      system("tmux send-keys -t #{esc(session)}:#{esc(target)} C-c")
+    end
+
+    def pane_target(window, pane_index)
+      "#{window}.#{pane_index}"
     end
 
     def move_window(session, src_name, dst_index)
@@ -97,8 +204,12 @@ module Mxup
       system("tmux swap-window -s #{esc(session)}:#{idx_a} -t #{esc(session)}:#{idx_b}")
     end
 
-    def capture_pane(session, window, lines)
-      `tmux capture-pane -t #{esc(session)}:#{esc(window)} -p -S -#{lines} 2>/dev/null`
+    def capture_pane(session, target, lines)
+      `tmux capture-pane -t #{esc(session)}:#{esc(target)} -p -S -#{lines} 2>/dev/null`
+    end
+
+    def pane_count(session, window)
+      `tmux list-panes -t #{esc(session)}:#{esc(window)} 2>/dev/null`.strip.split("\n").size
     end
 
     def esc(val)
@@ -107,10 +218,11 @@ module Mxup
   end
 
   class Runner
-    def initialize(config, dry_run: false)
+    def initialize(config, dry_run: false, layout: nil)
       @config = config
       @dry_run = dry_run
       @session = config.session
+      @requested_layout = layout
     end
 
     def up
@@ -130,49 +242,66 @@ module Mxup
 
       created = Tmux.session_created(@session)
       ts = Time.at(created.to_i).strftime('%Y-%m-%d %H:%M:%S')
-      puts "SESSION: #{@session} — up since #{ts}"
+      active = active_layout_name
+      layout_info = active ? " (layout: #{active})" : ''
+      puts "SESSION: #{@session} — up since #{ts}#{layout_info}"
       puts
 
       panes = Tmux.list_panes(@session)
+      groups = active ? @config.groups_for(active) : []
+      group_map = {}
+      groups.each { |g| g.window_names.each_with_index { |wn, i| group_map[wn] = [g, i] } }
       declared_names = @config.windows.map(&:name)
 
-      panes.each do |pane|
-        tag = if declared_names.include?(pane[:name])
-                ''
-              else
-                ' [NOT IN CONFIG]'
-              end
+      printed_windows = Set.new
+      effective_order = @config.effective_window_order(active)
 
-        idle = SHELLS.include?(pane[:fg_cmd])
-        status_str = if idle
-                       "IDLE (shell: #{pane[:fg_cmd]}, pid=#{pane[:pid]})"
-                     else
-                       leaf = find_leaf(pane[:pid])
-                       cmd = ps_field(leaf, 'args') || pane[:fg_cmd]
-                       elapsed = ps_field(leaf, 'etime')&.strip || '?'
-                       started = ps_field(leaf, 'lstart') || '?'
-                       "RUNNING  pid=#{leaf}  elapsed=#{elapsed}  fg=#{pane[:fg_cmd]}\n" \
-                       "    command: #{cmd}\n" \
-                       "    started: #{started}"
-                     end
+      effective_order.each do |entry|
+        if entry[:type] == :group
+          group = entry[:group]
+          group_panes = panes.select { |p| p[:name] == group.name }
+            .sort_by { |p| p[:pane_index] }
 
-        puts "[#{pane[:index]}] #{pane[:name]}#{tag}"
-        puts "    cwd: #{pane[:cwd]}"
-        puts "    #{status_str}"
+          if group_panes.empty?
+            group.window_names.each { |wn| puts "[?] #{wn}  MISSING (group: #{group.name})"; puts }
+            next
+          end
 
-        output = Tmux.capture_pane(@session, pane[:name], lines)
-          .split("\n").reject(&:empty?)
-        unless output.empty?
-          puts "    --- last output (up to #{lines} lines) ---"
-          output.each { |l| puts "    #{l}" }
-          puts '    ---'
+          puts "[#{group_panes.first[:window_index]}] #{group.name} (#{group.window_names.join(', ')})  split=#{group.split}"
+
+          group.window_names.each_with_index do |wn, idx|
+            printed_windows << wn
+            pane = group_panes.find { |p| p[:pane_index] == idx }
+            if pane.nil?
+              puts "    pane #{idx} (#{wn}): MISSING"
+              next
+            end
+            print_pane_status(pane, wn, lines, indent: '    ')
+          end
+          puts
+
+        else
+          wn = entry[:name]
+          printed_windows << wn
+          pane = panes.find { |p| p[:name] == wn && p[:pane_index] == 0 }
+          if pane.nil?
+            puts "[?] #{wn}  MISSING"
+            puts
+            next
+          end
+
+          tag = declared_names.include?(pane[:name]) ? '' : ' [NOT IN CONFIG]'
+          puts "[#{pane[:window_index]}] #{pane[:name]}#{tag}"
+          print_pane_status(pane, wn, lines, indent: '    ')
+          puts
         end
-        puts
       end
 
-      missing = declared_names - panes.map { |p| p[:name] }
-      missing.each do |name|
-        puts "[?] #{name}  MISSING"
+      panes.each do |pane|
+        logical = pane[:title].to_s.empty? ? pane[:name] : pane[:title]
+        next if printed_windows.include?(logical) || printed_windows.include?(pane[:name])
+        puts "[#{pane[:window_index]}] #{pane[:name]} [NOT IN CONFIG]"
+        print_pane_status(pane, pane[:name], lines, indent: '    ')
         puts
       end
     end
@@ -180,8 +309,9 @@ module Mxup
     def down
       if Tmux.has_session?(@session)
         if @dry_run
-          puts "[dry-run] Would kill session #{@session}"
+          puts "[dry-run] Would gracefully stop session #{@session}"
         else
+          graceful_stop
           Tmux.kill_session(@session)
           puts "Session #{@session} killed."
         end
@@ -202,49 +332,191 @@ module Mxup
                   end
                 end
 
-      existing = Tmux.list_windows(@session).map { |w| w[:name] }
+      active = active_layout_name
 
       targets.each do |win|
-        if existing.include?(win.name)
+        target_ref = resolve_pane_target(win.name, active)
+        if target_ref
           if @dry_run
             puts "[dry-run] Would restart #{win.name}"
           else
-            Tmux.send_interrupt(@session, win.name)
+            Tmux.send_interrupt(@session, target_ref)
             sleep 1
-            Tmux.send_interrupt(@session, win.name)
+            Tmux.send_interrupt(@session, target_ref)
             sleep 1
-            Tmux.send_keys(@session, win.name, assemble_command(win))
+            Tmux.send_keys(@session, target_ref, assemble_command(win))
             puts "  #{win.name}: restarted"
           end
         else
           if @dry_run
             puts "[dry-run] Would create #{win.name}"
           else
-            create_window(win)
+            create_standalone_window(win)
             puts "  #{win.name}: created"
           end
         end
       end
     end
 
-    private
+    def switch_layout(target_layout)
+      abort "Session #{@session} is not running." unless Tmux.has_session?(@session)
+      abort "Layout '#{target_layout}' not found in config. Available: #{@config.layout_names.join(', ')}" \
+        unless @config.layout_names.include?(target_layout)
 
-    def create_fresh
-      puts "Creating session #{@session}..."
-      first = @config.windows.first
+      current = stored_layout_name
 
-      if @dry_run
-        @config.windows.each { |w| puts "[dry-run] Would create window: #{w.name}" }
+      if current == target_layout
+        puts "Already using layout '#{target_layout}'."
         return
       end
 
-      Tmux.new_session(@session, first.name, first.root)
-      Tmux.send_keys(@session, first.name, assemble_command(first))
-      puts "  #{first.name}: created"
+      if @dry_run
+        puts "[dry-run] Would switch layout from '#{current}' to '#{target_layout}'"
+        return
+      end
 
-      @config.windows.drop(1).each do |win|
-        create_window(win)
+      puts "Switching layout: #{current || 'none'} → #{target_layout}..."
+
+      flatten_to_standalone
+      apply_layout(target_layout)
+      reorder_windows
+      Tmux.set_environment(@session, 'MXUP_LAYOUT', target_layout)
+
+      puts "Layout switched to '#{target_layout}'."
+    end
+
+    def show_layouts
+      active = Tmux.has_session?(@session) ? active_layout_name : nil
+      if @config.layout_names.empty?
+        puts "No layouts defined in config."
+        return
+      end
+      puts "Available layouts:"
+      @config.layout_names.each do |name|
+        marker = name == active ? ' (active)' : ''
+        groups = @config.groups_for(name)
+        if groups.empty?
+          puts "  #{name}#{marker}: flat (all standalone)"
+        else
+          group_desc = groups.map { |g| "#{g.name}=[#{g.window_names.join(',')}]" }.join(', ')
+          puts "  #{name}#{marker}: #{group_desc}"
+        end
+      end
+    end
+
+    private
+
+    def active_layout_name
+      if @requested_layout
+        @requested_layout
+      elsif Tmux.has_session?(@session)
+        stored = Tmux.show_environment(@session, 'MXUP_LAYOUT')
+        stored && @config.layout_names.include?(stored) ? stored : @config.default_layout
+      else
+        @config.default_layout
+      end
+    end
+
+    def stored_layout_name
+      if Tmux.has_session?(@session)
+        stored = Tmux.show_environment(@session, 'MXUP_LAYOUT')
+        stored && @config.layout_names.include?(stored) ? stored : @config.default_layout
+      else
+        @config.default_layout
+      end
+    end
+
+    def resolve_pane_target(window_name, layout_name)
+      result = @config.find_group_for_window(layout_name, window_name)
+      if result
+        group, pane_idx = result
+        existing = Tmux.list_windows(@session).map { |w| w[:name] }
+        return nil unless existing.include?(group.name)
+        Tmux.pane_target(group.name, pane_idx)
+      else
+        existing = Tmux.list_windows(@session).map { |w| w[:name] }
+        return nil unless existing.include?(window_name)
+        window_name
+      end
+    end
+
+    def graceful_stop(timeout: 30)
+      puts "Stopping session #{@session}..."
+      deadline = Time.now + timeout
+      round = 0
+
+      loop do
+        break unless Tmux.has_session?(@session)
+
+        panes = Tmux.list_panes(@session)
+        busy = panes.reject { |p| SHELLS.include?(p[:fg_cmd]) }
+        break if busy.empty?
+
+        if round > 0
+          remaining = (deadline - Time.now).ceil
+          puts "  waiting... #{busy.size} process#{'es' unless busy.size == 1} still running (#{remaining}s left)"
+        end
+
+        busy.each do |pane|
+          target = Tmux.pane_target(pane[:name], pane[:pane_index])
+          Tmux.send_interrupt(@session, target)
+        end
+
+        if Time.now >= deadline
+          names = busy.map { |p| p[:title].to_s.empty? ? p[:name] : p[:title] }.uniq
+          warn "  timeout: #{names.join(', ')} did not exit in #{timeout}s — killing anyway"
+          break
+        end
+
+        round += 1
+        sleep 1
+      end
+    end
+
+    def create_fresh
+      puts "Creating session #{@session}..."
+      layout = active_layout_name
+      order = @config.effective_window_order(layout)
+
+      if @dry_run
+        order.each do |entry|
+          if entry[:type] == :group
+            puts "[dry-run] Would create pane group: #{entry[:name]} (#{entry[:group].window_names.join(', ')})"
+          else
+            puts "[dry-run] Would create window: #{entry[:name]}"
+          end
+        end
+        return
+      end
+
+      first_entry = order.first
+      if first_entry[:type] == :group
+        group = first_entry[:group]
+        first_win = @config.window_by_name(group.window_names.first)
+        Tmux.new_session(@session, group.name, first_win.root)
+        setup_pane_group_in_existing_window(group)
+        puts "  #{group.name}: created (#{group.window_names.join(', ')})"
+      else
+        win = @config.window_by_name(first_entry[:name])
+        Tmux.new_session(@session, win.name, win.root)
+        Tmux.set_pane_title(@session, win.name, 0, win.name)
+        Tmux.send_keys(@session, win.name, assemble_command(win))
         puts "  #{win.name}: created"
+      end
+
+      order.drop(1).each do |entry|
+        if entry[:type] == :group
+          create_pane_group(entry[:group])
+          puts "  #{entry[:name]}: created (#{entry[:group].window_names.join(', ')})"
+        else
+          win = @config.window_by_name(entry[:name])
+          create_standalone_window(win)
+          puts "  #{win.name}: created"
+        end
+      end
+
+      if layout
+        Tmux.set_environment(@session, 'MXUP_LAYOUT', layout)
       end
 
       puts "Session #{@session} is up (#{@config.windows.size} windows)."
@@ -252,12 +524,19 @@ module Mxup
 
     def reconcile
       puts "Reconciling session #{@session}..."
-      existing = Tmux.list_panes(@session)
-      existing_names = existing.map { |p| p[:name] }
-      declared_names = @config.windows.map(&:name)
+      layout = active_layout_name
+      stored = Tmux.show_environment(@session, 'MXUP_LAYOUT')
 
-      # Remove extra windows
-      extras = existing_names - declared_names
+      if layout && stored && stored != layout
+        switch_layout(layout)
+      end
+
+      existing = Tmux.list_panes(@session)
+      existing_win_names = Tmux.list_windows(@session).map { |w| w[:name] }
+      order = @config.effective_window_order(layout)
+
+      expected_tmux_windows = order.map { |e| e[:name] }.to_set
+      extras = existing_win_names.reject { |n| expected_tmux_windows.include?(n) }
       extras.each do |name|
         if @dry_run
           puts "  [dry-run] Would remove extra window: #{name}"
@@ -267,35 +546,161 @@ module Mxup
         end
       end
 
-      # Create missing or restart idle
-      @config.windows.each do |win|
-        pane = existing.find { |p| p[:name] == win.name }
-        if pane.nil?
-          if @dry_run
-            puts "  [dry-run] Would create missing window: #{win.name}"
-          else
-            create_window(win)
-            puts "  #{win.name}: created (was missing)"
-          end
-        elsif SHELLS.include?(pane[:fg_cmd])
-          if @dry_run
-            puts "  [dry-run] Would restart idle window: #{win.name}"
-          else
-            Tmux.send_keys(@session, win.name, assemble_command(win))
-            puts "  #{win.name}: restarted (was idle)"
-          end
+      order.each do |entry|
+        if entry[:type] == :group
+          reconcile_group(entry[:group], existing, existing_win_names)
         else
-          puts "  #{win.name}: running (#{pane[:fg_cmd]}) — ok"
+          reconcile_standalone(entry[:name], existing, existing_win_names)
         end
       end
 
       reorder_windows
+      if layout
+        Tmux.set_environment(@session, 'MXUP_LAYOUT', layout)
+      end
       puts 'Reconciliation complete.'
     end
 
-    def create_window(win)
+    def reconcile_group(group, existing_panes, existing_win_names)
+      unless existing_win_names.include?(group.name)
+        if @dry_run
+          puts "  [dry-run] Would create pane group: #{group.name}"
+        else
+          create_pane_group(group)
+          puts "  #{group.name}: created (#{group.window_names.join(', ')})"
+        end
+        return
+      end
+
+      current_count = Tmux.pane_count(@session, group.name)
+      expected_count = group.window_names.size
+
+      if current_count != expected_count
+        if @dry_run
+          puts "  [dry-run] Would recreate pane group: #{group.name} (pane count #{current_count} != #{expected_count})"
+        else
+          Tmux.kill_window(@session, group.name)
+          create_pane_group(group)
+          puts "  #{group.name}: recreated (pane count changed)"
+        end
+        return
+      end
+
+      group_panes = existing_panes.select { |p| p[:name] == group.name }
+        .sort_by { |p| p[:pane_index] }
+
+      group.window_names.each_with_index do |wn, idx|
+        win = @config.window_by_name(wn)
+        pane = group_panes.find { |p| p[:pane_index] == idx }
+        next unless pane
+
+        target = Tmux.pane_target(group.name, idx)
+        if SHELLS.include?(pane[:fg_cmd])
+          if @dry_run
+            puts "  [dry-run] Would restart idle pane: #{wn} in #{group.name}"
+          else
+            Tmux.send_keys(@session, target, assemble_command(win))
+            puts "  #{wn}: restarted (was idle) [#{group.name}.#{idx}]"
+          end
+        else
+          puts "  #{wn}: running (#{pane[:fg_cmd]}) — ok [#{group.name}.#{idx}]"
+        end
+      end
+    end
+
+    def reconcile_standalone(window_name, existing_panes, existing_win_names)
+      win = @config.window_by_name(window_name)
+      pane = existing_panes.find { |p| p[:name] == window_name }
+
+      if pane.nil?
+        if @dry_run
+          puts "  [dry-run] Would create missing window: #{window_name}"
+        else
+          create_standalone_window(win)
+          puts "  #{window_name}: created (was missing)"
+        end
+      elsif SHELLS.include?(pane[:fg_cmd])
+        if @dry_run
+          puts "  [dry-run] Would restart idle window: #{window_name}"
+        else
+          Tmux.send_keys(@session, window_name, assemble_command(win))
+          puts "  #{window_name}: restarted (was idle)"
+        end
+      else
+        puts "  #{window_name}: running (#{pane[:fg_cmd]}) — ok"
+      end
+    end
+
+    def create_pane_group(group)
+      first_win = @config.window_by_name(group.window_names.first)
+      Tmux.new_window(@session, group.name, first_win.root)
+      setup_pane_group_in_existing_window(group)
+    end
+
+    def setup_pane_group_in_existing_window(group)
+      first_win = @config.window_by_name(group.window_names.first)
+      Tmux.set_pane_title(@session, group.name, 0, first_win.name)
+      Tmux.send_keys(@session, Tmux.pane_target(group.name, 0), assemble_command(first_win))
+
+      group.window_names.drop(1).each_with_index do |wn, i|
+        win = @config.window_by_name(wn)
+        Tmux.split_window(@session, group.name, win.root)
+        pane_idx = i + 1
+        Tmux.select_layout(@session, group.name, group.split)
+        Tmux.set_pane_title(@session, group.name, pane_idx, win.name)
+        Tmux.send_keys(@session, Tmux.pane_target(group.name, pane_idx), assemble_command(win))
+      end
+
+      Tmux.select_layout(@session, group.name, group.split)
+    end
+
+    def create_standalone_window(win)
       Tmux.new_window(@session, win.name, win.root)
+      Tmux.set_pane_title(@session, win.name, 0, win.name)
       Tmux.send_keys(@session, win.name, assemble_command(win))
+    end
+
+    def flatten_to_standalone
+      panes = Tmux.list_panes(@session)
+      windows_with_multi_panes = panes.group_by { |p| p[:name] }
+        .select { |_, ps| ps.size > 1 }
+
+      windows_with_multi_panes.each do |win_name, win_panes|
+        sorted = win_panes.sort_by { |p| p[:pane_index] }.reverse
+        sorted.each do |pane|
+          next if pane[:pane_index] == 0
+          logical_name = pane[:title].to_s.empty? ? "#{win_name}_#{pane[:pane_index]}" : pane[:title]
+          Tmux.break_pane(@session, win_name, pane[:pane_index], logical_name)
+        end
+        first_pane = sorted.last
+        first_logical = first_pane[:title].to_s.empty? ? win_name : first_pane[:title]
+        Tmux.rename_window(@session, win_name, first_logical) if first_logical != win_name
+      end
+    end
+
+    def apply_layout(layout_name)
+      groups = @config.groups_for(layout_name)
+      groups.each do |group|
+        next if group.window_names.size < 2
+
+        first_wn = group.window_names.first
+        Tmux.rename_window(@session, first_wn, group.name)
+
+        group.window_names.drop(1).each do |wn|
+          Tmux.join_pane(@session, wn, group.name)
+        end
+
+        group.window_names.each_with_index do |wn, idx|
+          Tmux.set_pane_title(@session, group.name, idx, wn)
+        end
+        Tmux.select_layout(@session, group.name, group.split)
+      end
+
+      groups.select { |g| g.window_names.size == 1 }.each do |group|
+        wn = group.window_names.first
+        Tmux.rename_window(@session, wn, group.name)
+        Tmux.set_pane_title(@session, group.name, 0, wn)
+      end
     end
 
     def assemble_command(win)
@@ -321,18 +726,45 @@ module Mxup
     def reorder_windows
       return if @dry_run
 
-      declared_names = @config.windows.map(&:name)
+      layout = active_layout_name
+      order = @config.effective_window_order(layout)
+      names = order.map { |e| e[:name] }
 
-      # First pass: move all to high temp indices to free up slots
-      declared_names.each_with_index do |name, i|
+      names.each_with_index do |name, i|
         cur = Tmux.list_windows(@session).find { |w| w[:name] == name }
         next unless cur
         Tmux.move_window(@session, name, 900 + i)
       end
 
-      # Second pass: move from temp to final positions
-      declared_names.each_with_index do |name, target_idx|
+      names.each_with_index do |name, target_idx|
         Tmux.move_window(@session, name, target_idx)
+      end
+    end
+
+    def print_pane_status(pane, logical_name, lines, indent: '    ')
+      idle = SHELLS.include?(pane[:fg_cmd])
+      status_str = if idle
+                     "IDLE (shell: #{pane[:fg_cmd]}, pid=#{pane[:pid]})"
+                   else
+                     leaf = find_leaf(pane[:pid])
+                     cmd = ps_field(leaf, 'args') || pane[:fg_cmd]
+                     elapsed = ps_field(leaf, 'etime')&.strip || '?'
+                     started = ps_field(leaf, 'lstart') || '?'
+                     "RUNNING  pid=#{leaf}  elapsed=#{elapsed}  fg=#{pane[:fg_cmd]}\n" \
+                     "#{indent}command: #{cmd}\n" \
+                     "#{indent}started: #{started}"
+                   end
+
+      puts "#{indent}cwd: #{pane[:cwd]}"
+      puts "#{indent}#{status_str}"
+
+      target = pane[:pane_index] > 0 ? Tmux.pane_target(pane[:name], pane[:pane_index]) : pane[:name]
+      output = Tmux.capture_pane(@session, target, lines)
+        .split("\n").reject(&:empty?)
+      unless output.empty?
+        puts "#{indent}--- last output (up to #{lines} lines) ---"
+        output.each { |l| puts "#{indent}#{l}" }
+        puts "#{indent}---"
       end
     end
 
@@ -355,14 +787,14 @@ module Mxup
   class CLI
     def run(argv)
       args = argv.dup
-      options = { dry_run: false, config: nil, lines: 15 }
+      options = { dry_run: false, config: nil, lines: 15, layout: nil }
 
-      # Extract flags before parsing subcommands
       parser = OptionParser.new do |opts|
         opts.banner = "Usage: mxup [command] [name] [options]"
         opts.on('-f', '--file FILE', 'Config file path') { |f| options[:config] = f }
         opts.on('--dry-run', 'Preview changes without applying') { options[:dry_run] = true }
         opts.on('--lines N', Integer, 'Output lines per window (status)') { |n| options[:lines] = n }
+        opts.on('--layout NAME', 'Layout to use (for up/layout commands)') { |l| options[:layout] = l }
         opts.on('-v', '--version', 'Show version') { puts "mxup #{VERSION}"; exit }
         opts.on('-h', '--help', 'Show help') { puts opts; exit }
       end
@@ -372,7 +804,7 @@ module Mxup
       command = 'up'
       if args.first && !args.first.include?('.yml') && !args.first.include?('/')
         maybe_cmd = args.first
-        if %w[up status down restart].include?(maybe_cmd)
+        if %w[up status down restart layout].include?(maybe_cmd)
           command = args.shift
         end
       end
@@ -384,7 +816,6 @@ module Mxup
           name, windows_str = target.split(':', 2)
           window_names = windows_str ? windows_str.split(',') : []
         elsif target
-          # Could be a session name (followed by window args) or a window name
           candidate = File.join(CONFIG_DIR, "#{target}.yml")
           if File.exist?(candidate) || (options[:config] && target !~ /,/)
             name = target
@@ -398,13 +829,24 @@ module Mxup
           window_names = []
         end
         config = load_config(options[:config], name)
-        runner = Runner.new(config, dry_run: options[:dry_run])
+        runner = Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
         runner.restart(window_names)
+
+      when 'layout'
+        name = args.shift
+        target_layout = args.shift
+        config = load_config(options[:config], name)
+        runner = Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
+        if target_layout
+          runner.switch_layout(target_layout)
+        else
+          runner.show_layouts
+        end
 
       when 'up', 'status', 'down'
         name = args.shift
         config = load_config(options[:config], name)
-        runner = Runner.new(config, dry_run: options[:dry_run])
+        runner = Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
 
         case command
         when 'up'     then runner.up
@@ -413,7 +855,7 @@ module Mxup
         end
 
       else
-        abort "Unknown command: #{command}. Use: up, status, down, restart"
+        abort "Unknown command: #{command}. Use: up, status, down, restart, layout"
       end
     end
 
@@ -436,7 +878,6 @@ module Mxup
       local = File.join(Dir.pwd, 'mxup.yml')
       return local if File.exist?(local)
 
-      # If only one config exists, use it
       if Dir.exist?(CONFIG_DIR)
         configs = Dir.glob(File.join(CONFIG_DIR, '*.yml'))
         return configs.first if configs.size == 1

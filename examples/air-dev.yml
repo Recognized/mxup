@@ -6,6 +6,10 @@
 #   mxup restart air-dev:air-backend
 #   mxup down air-dev
 #
+# Switch layouts:
+#   mxup layout air-dev compact
+#   mxup up air-dev --layout=flat
+#
 # Parameterize via env vars:
 #   DOCKER_PROFILES=agentic-core DOCKER_LOCAL=air-backend mxup up air-dev
 
@@ -47,3 +51,19 @@ windows:
 
   scratch:
     root: ~/IdeaProjects/jcp-air
+
+layouts:
+  full:
+    services:
+      panes: [docker, air-backend, agent-spawner]
+      split: main-vertical
+    frontend:
+      panes: [air-frontend, dev-kit]
+      split: even-horizontal
+
+  compact:
+    all:
+      panes: [docker, air-backend, agent-spawner, air-frontend, dev-kit]
+      split: tiled
+
+  flat: {}

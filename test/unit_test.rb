@@ -91,7 +91,9 @@ class ConfigTest < Minitest::Test
     assert_equal 'web', win.name
     assert_equal '/tmp', win.root  # /tmp doesn't have ~ so stays as-is
     assert_equal 'npm start', win.command
-    assert_equal 'localhost:5432', win.wait_for
+    assert_instance_of Mxup::WaitSpec, win.wait_for
+    assert_equal :tcp, win.wait_for.type
+    assert_equal 'localhost:5432', win.wait_for.target
     assert_equal({ 'NODE_ENV' => 'production', 'PORT' => '3000' }, win.env)
   end
 
@@ -156,7 +158,73 @@ class ConfigTest < Minitest::Test
   end
 end
 
-class AssembleCommandTest < Minitest::Test
+class WaitSpecTest < Minitest::Test
+  def test_string_parses_as_tcp
+    spec = Mxup::WaitSpec.parse('localhost:5432')
+    assert_equal :tcp, spec.type
+    assert_equal 'localhost:5432', spec.target
+    assert_equal 2, spec.interval
+    assert_nil spec.timeout
+    assert_equal 'localhost:5432', spec.label
+  end
+
+  def test_nil_returns_nil
+    assert_nil Mxup::WaitSpec.parse(nil)
+  end
+
+  def test_hash_tcp
+    spec = Mxup::WaitSpec.parse('tcp' => 'db:5432', 'timeout' => 30)
+    assert_equal :tcp, spec.type
+    assert_equal 'db:5432', spec.target
+    assert_equal 30, spec.timeout
+    assert_equal 2, spec.interval
+    assert_equal 'db:5432', spec.label
+  end
+
+  def test_hash_http
+    spec = Mxup::WaitSpec.parse('http' => 'http://localhost:8080/health')
+    assert_equal :http, spec.type
+    assert_equal 'http://localhost:8080/health', spec.target
+    assert_equal 'http://localhost:8080/health', spec.label
+  end
+
+  def test_hash_path
+    spec = Mxup::WaitSpec.parse('path' => '/tmp/app.sock')
+    assert_equal :path, spec.type
+    assert_equal '/tmp/app.sock', spec.target
+  end
+
+  def test_hash_script
+    spec = Mxup::WaitSpec.parse('script' => 'pg_isready -h localhost')
+    assert_equal :script, spec.type
+    assert_equal 'pg_isready -h localhost', spec.target
+    assert_equal 'readiness check', spec.label
+  end
+
+  def test_hash_script_with_label
+    spec = Mxup::WaitSpec.parse('script' => 'pg_isready -h localhost', 'label' => 'postgres')
+    assert_equal 'postgres', spec.label
+  end
+
+  def test_custom_interval
+    spec = Mxup::WaitSpec.parse('tcp' => 'localhost:5432', 'interval' => 5)
+    assert_equal 5, spec.interval
+  end
+
+  def test_no_check_type_raises
+    assert_raises(ArgumentError) { Mxup::WaitSpec.parse('timeout' => 10) }
+  end
+
+  def test_multiple_check_types_raises
+    assert_raises(ArgumentError) { Mxup::WaitSpec.parse('tcp' => 'a:1', 'http' => 'http://b') }
+  end
+
+  def test_invalid_type_raises
+    assert_raises(ArgumentError) { Mxup::WaitSpec.parse(42) }
+  end
+end
+
+class LauncherScriptTest < Minitest::Test
   def setup
     @dir = Dir.mktmpdir
   end
@@ -177,6 +245,20 @@ class AssembleCommandTest < Minitest::Test
     runner.send(:assemble_command, win)
   end
 
+  def launcher_content(runner, win)
+    runner.send(:write_launcher_scripts)
+    path = runner.send(:launcher_script_path, win.name)
+    File.exist?(path) ? File.read(path) : nil
+  ensure
+    runner.send(:cleanup_runtime_dir)
+  end
+
+  def wait_block(runner, name, spec)
+    runner.send(:generate_wait_block, name, spec).join("\n")
+  end
+
+  # --- assemble_command returns source of launcher script ---
+
   def test_command_only
     config, runner = make_runner(<<~YAML)
       session: s
@@ -186,7 +268,9 @@ class AssembleCommandTest < Minitest::Test
           command: ./run.sh
     YAML
     result = assemble(runner, config.windows.first)
-    assert_equal './run.sh', result
+    assert_match(/\. .+w_launcher\.sh$/, result)
+    content = launcher_content(runner, config.windows.first)
+    assert_includes content, './run.sh'
   end
 
   def test_setup_prepended
@@ -199,14 +283,13 @@ class AssembleCommandTest < Minitest::Test
           root: /tmp
           command: ./run.sh
     YAML
-    result = assemble(runner, config.windows.first)
-    assert_includes result, 'echo setup'
-    assert_includes result, './run.sh'
-    # Setup comes before the command
-    assert result.index('echo setup') < result.index('./run.sh')
+    content = launcher_content(runner, config.windows.first)
+    assert_includes content, 'echo setup'
+    assert_includes content, './run.sh'
+    assert content.index('echo setup') < content.index('./run.sh')
   end
 
-  def test_wait_for_generates_nc_loop
+  def test_wait_for_inlined
     config, runner = make_runner(<<~YAML)
       session: s
       windows:
@@ -215,11 +298,10 @@ class AssembleCommandTest < Minitest::Test
           wait_for: localhost:5432
           command: ./run.sh
     YAML
-    result = assemble(runner, config.windows.first)
-    assert_includes result, "nc -z localhost 5432"
-    assert_includes result, "Waiting for localhost:5432"
-    assert_includes result, "localhost:5432 is ready"
-    assert_includes result, './run.sh'
+    content = launcher_content(runner, config.windows.first)
+    assert_includes content, 'nc -z localhost 5432'
+    assert_includes content, './run.sh'
+    assert content.index('nc -z') < content.index('./run.sh')
   end
 
   def test_env_exports
@@ -233,10 +315,10 @@ class AssembleCommandTest < Minitest::Test
             BAZ: "hello world"
           command: ./run.sh
     YAML
-    result = assemble(runner, config.windows.first)
-    assert_includes result, 'export FOO=bar'
-    assert_includes result, 'export BAZ=hello\\ world'
-    assert_includes result, './run.sh'
+    content = launcher_content(runner, config.windows.first)
+    assert_includes content, 'export FOO=bar'
+    assert_includes content, 'export BAZ=hello\\ world'
+    assert_includes content, './run.sh'
   end
 
   def test_no_command_window
@@ -248,10 +330,21 @@ class AssembleCommandTest < Minitest::Test
         shell:
           root: /tmp
     YAML
+    content = launcher_content(runner, config.windows.first)
+    assert_includes content, 'echo hi'
+    refute_includes content, 'nil'
+    refute_includes content, 'wait_for'
+  end
+
+  def test_empty_window_returns_empty_command
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        shell:
+          root: /tmp
+    YAML
     result = assemble(runner, config.windows.first)
-    assert_includes result, 'echo hi'
-    refute_includes result, 'nil'
-    refute_includes result, 'sleep'
+    assert_equal '', result
   end
 
   def test_full_assembly_order
@@ -267,17 +360,157 @@ class AssembleCommandTest < Minitest::Test
             KEY: val
           command: ./start
     YAML
-    result = assemble(runner, config.windows.first)
-    parts = result.split('; ')
+    content = launcher_content(runner, config.windows.first)
 
-    setup_idx = parts.index { |p| p.include?('direnv') }
-    wait_idx = parts.index { |p| p.include?('Waiting') }
-    export_idx = parts.index { |p| p.include?('export') }
-    cmd_idx = parts.index { |p| p.include?('./start') }
+    setup_pos = content.index('direnv')
+    wait_pos = content.index('Waiting for')
+    export_pos = content.index('export')
+    cmd_pos = content.index('./start')
 
-    assert setup_idx < wait_idx, "setup should come before wait_for"
-    assert wait_idx < export_idx, "wait_for should come before env"
-    assert export_idx < cmd_idx, "env should come before command"
+    assert setup_pos < wait_pos, "setup should come before wait_for"
+    assert wait_pos < export_pos, "wait_for should come before env"
+    assert export_pos < cmd_pos, "env should come before command"
+  end
+
+  # --- generate_wait_block tests ---
+
+  def test_wait_block_tcp
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for: localhost:5432
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "nc -z localhost 5432"
+    assert_includes block, "Waiting for localhost:5432"
+    assert_includes block, "still waiting"
+    assert_includes block, "localhost:5432 is ready"
+    assert_includes block, "sleep 2"
+  end
+
+  def test_wait_block_http
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for:
+            http: http://localhost:8080/health
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "curl -sf"
+    assert_includes block, "http://localhost:8080/health"
+    assert_includes block, "Waiting for http://localhost:8080/health"
+    assert_includes block, "http://localhost:8080/health is ready"
+  end
+
+  def test_wait_block_path
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for:
+            path: /tmp/app.sock
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "[ -e"
+    assert_includes block, "/tmp/app.sock"
+    assert_includes block, "Waiting for /tmp/app.sock"
+  end
+
+  def test_wait_block_script
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for:
+            script: pg_isready -h localhost
+            label: postgres
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "pg_isready -h localhost"
+    assert_includes block, "Waiting for postgres"
+    assert_includes block, "postgres is ready"
+  end
+
+  def test_wait_block_with_timeout
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for:
+            tcp: localhost:5432
+            timeout: 60
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "nc -z localhost 5432"
+    assert_includes block, "_mxup_wait_start=$(date +%s)"
+    assert_includes block, "Timed out waiting for localhost:5432 after 60s"
+    assert_includes block, "still waiting"
+    assert_includes block, "of 60s"
+  end
+
+  def test_wait_block_custom_interval
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for:
+            tcp: localhost:5432
+            interval: 5
+    YAML
+    block = wait_block(runner, 'w', config.windows.first.wait_for)
+    assert_includes block, "sleep 5"
+    refute_includes block, "sleep 2"
+  end
+
+  # --- write_launcher_scripts ---
+
+  def test_write_creates_executable_launcher_scripts
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          wait_for: localhost:5432
+          command: ./run.sh
+        no_cmd:
+          root: /tmp
+          command: echo hi
+    YAML
+    runner.send(:write_launcher_scripts)
+    w_path = runner.send(:launcher_script_path, 'w')
+    assert File.exist?(w_path), "Launcher script should be created for w"
+    assert File.executable?(w_path), "Launcher script should be executable"
+    content = File.read(w_path)
+    assert_includes content, "nc -z localhost 5432"
+    assert_includes content, "./run.sh"
+
+    no_cmd_path = runner.send(:launcher_script_path, 'no_cmd')
+    assert File.exist?(no_cmd_path), "Launcher script should be created for no_cmd"
+    assert_includes File.read(no_cmd_path), "echo hi"
+  ensure
+    runner.send(:cleanup_runtime_dir)
+  end
+
+  def test_no_script_for_empty_window
+    config, runner = make_runner(<<~YAML)
+      session: s
+      windows:
+        shell:
+          root: /tmp
+    YAML
+    runner.send(:write_launcher_scripts)
+    path = runner.send(:launcher_script_path, 'shell')
+    refute File.exist?(path), "No script for empty windows"
+  ensure
+    runner.send(:cleanup_runtime_dir)
   end
 end
 

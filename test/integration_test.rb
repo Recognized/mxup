@@ -532,6 +532,57 @@ class IntegrationTest < Minitest::Test
     assert_equal 'b', panes[1][:title]
   end
 
+  def test_three_pane_group_titles_and_roots
+    dir_a = Dir.mktmpdir('mxup-a')
+    dir_b = Dir.mktmpdir('mxup-b')
+    dir_c = Dir.mktmpdir('mxup-c')
+
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        a:
+          root: #{dir_a}
+          command: sleep 600
+        b:
+          root: #{dir_b}
+          command: sleep 600
+        c:
+          root: #{dir_c}
+          command: sleep 600
+      layouts:
+        full:
+          grp:
+            panes: [a, b, c]
+            split: main-vertical
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    panes = Mxup::Tmux.list_panes(SESSION).select { |p| p[:name] == 'grp' }
+      .sort_by { |p| p[:pane_index] }
+
+    assert_equal 3, panes.size
+    assert_equal 'a', panes[0][:title]
+    assert_equal 'b', panes[1][:title]
+    assert_equal 'c', panes[2][:title]
+
+    assert_equal File.realpath(dir_a), File.realpath(panes[0][:cwd])
+    assert_equal File.realpath(dir_b), File.realpath(panes[1][:cwd])
+    assert_equal File.realpath(dir_c), File.realpath(panes[2][:cwd])
+
+    wait_for_process('grp', 'sleep', pane_index: 0)
+    wait_for_process('grp', 'sleep', pane_index: 1)
+    wait_for_process('grp', 'sleep', pane_index: 2)
+
+    assert_equal 'sleep', pane_fg('grp', pane_index: 0)
+    assert_equal 'sleep', pane_fg('grp', pane_index: 1)
+    assert_equal 'sleep', pane_fg('grp', pane_index: 2)
+  ensure
+    FileUtils.rm_rf([dir_a, dir_b, dir_c])
+  end
+
   def test_layout_stored_in_environment
     path = write_config(<<~YAML)
       session: #{SESSION}

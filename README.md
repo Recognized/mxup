@@ -86,7 +86,53 @@ Per window:
 | `root` | yes | Working directory (supports `~`) |
 | `command` | no | Command to run. Omit for an interactive shell. |
 | `env` | no | Map of environment variables to export |
-| `wait_for` | no | `host:port` — wait for TCP connection before running command |
+| `wait_for` | no | Readiness check to pass before running command (see below) |
+
+### Wait-for checks
+
+`wait_for` blocks a window's command until a readiness condition is met.
+
+**Shorthand** — TCP check (backward compatible):
+
+```yaml
+wait_for: localhost:5432
+```
+
+**Expanded form** with explicit check type:
+
+```yaml
+# TCP port open
+wait_for:
+  tcp: localhost:5432
+
+# HTTP 2xx response
+wait_for:
+  http: http://localhost:8080/health
+
+# File or socket exists
+wait_for:
+  path: /tmp/app.sock
+
+# Arbitrary script (exit 0 = ready)
+wait_for:
+  script: pg_isready -h localhost -p 5432
+  label: postgres          # shown in wait/ready messages
+```
+
+All forms support optional `timeout` (seconds, default: unlimited) and `interval` (seconds between retries, default: 2):
+
+```yaml
+wait_for:
+  tcp: localhost:5432
+  timeout: 60
+  interval: 5
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `timeout` | unlimited | Max seconds to wait before giving up |
+| `interval` | 2 | Seconds between retry attempts |
+| `label` | target value | Display name in wait/ready messages |
 
 ### Parameterization
 

@@ -26,7 +26,7 @@ windows:
     command: >-
       node index.js up
       --profiles=${DOCKER_PROFILES:-agentic-core,ai-management,secrets}
-      --local=${DOCKER_LOCAL:-agent-spawner,air-backend}
+      --local=${DOCKER_LOCAL:-agent-spawner,ai-management,air-backend}
 
   air-backend:
     root: ~/IdeaProjects/jcp-air/cloud/backend
@@ -46,6 +46,13 @@ windows:
       SPAWNER_SERVICE_IDENTITIES__EXTERNAL__SERVICE_SECRET: jcp-agent-spawner
     command: ./gradlew :run
 
+  ai-management:
+    root: ~/IdeaProjects/jcp-all/ai-management
+    wait_for: localhost:5432
+    env:
+      JCP_CONFIG_RESOURCE: /application-local-dev.conf
+    command: ./gradlew run
+
   air-frontend:
     root: ~/IdeaProjects/jcp-air/cloud/frontend
     command: pnpm run dev
@@ -60,7 +67,7 @@ windows:
 layouts:
   full:
     services:
-      panes: [docker, air-backend, agent-spawner]
+      panes: [docker, air-backend, agent-spawner, ai-management]
       split: main-vertical
     frontend:
       panes: [air-frontend, dev-kit]
@@ -68,7 +75,7 @@ layouts:
 
   compact:
     all:
-      panes: [docker, air-backend, agent-spawner, air-frontend, dev-kit]
+      panes: [docker, air-backend, agent-spawner, ai-management, air-frontend, dev-kit]
       split: tiled
 
   flat: {}

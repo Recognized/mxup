@@ -37,6 +37,14 @@ require 'securerandom'
 # The private server is selected via TMUX_TMPDIR — tmux uses it as the socket
 # dir — which is transparently inherited by every subprocess we shell out to.
 
+# Speed knobs for tests. The production defaults (1s between Ctrl-C rounds,
+# 1s between interrupt rounds in graceful stop) are sensible for humans but
+# murder our test runtime — 5-6 restarts * 2s = 10-12s wasted waiting for
+# cosmetic prompt redraws. Shorten aggressively for tests; the reduced pause
+# is still longer than the send-keys -> prompt round-trip on this machine.
+Mxup::Runner.interrupt_delay     = 0.05
+Mxup::GracefulStop.round_interval = 0.1
+
 unless ENV['MXUP_SHARE_TMUX_SERVER']
   # CRITICAL: unset TMUX before doing anything. When tests run from inside a
   # tmux pane, TMUX points at the user's real server socket — and commands
@@ -154,11 +162,12 @@ module IntegrationHelpers
   # soon as it becomes truthy, or raising with `message` on timeout.
   # Leave `message: nil` to return nil on timeout instead of raising.
   #
-  # Interval defaults to 0.3s. Tighter intervals are counter-productive:
-  # each poll spawns a tmux(1) client, which contends with the tmux server
-  # for the same lock the panes' shells need to make progress. Polling too
-  # aggressively literally starves the test shells.
-  def wait_until(timeout: 10, interval: 0.3, message: nil)
+  # 0.05s interval keeps lock contention on the tmux server negligible
+  # (list-panes is cheap) while making happy-path waits resolve in
+  # ~1-2 polls instead of ~3-5. Timeout 5s is generous: on a healthy box
+  # the expected condition lands in <500ms; longer waits almost always
+  # signal a real failure, and returning sooner produces faster CI signal.
+  def wait_until(timeout: 5, interval: 0.05, message: nil)
     deadline = Time.now + timeout
     loop do
       result = yield
@@ -174,7 +183,7 @@ module IntegrationHelpers
     nil
   end
 
-  def wait_for_fg(window, expected, pane_index: 0, timeout: 10)
+  def wait_for_fg(window, expected, pane_index: 0, timeout: 5)
     wait_until(timeout: timeout,
                message: "pane #{window}.#{pane_index} fg == #{expected.inspect}") do
       pane_fg(window, pane_index: pane_index) == expected
@@ -247,7 +256,7 @@ class FreshStartTest < Minitest::Test
     assert_includes out, 'alpha: created'
     assert_includes out, 'beta: created'
 
-    wait_for_fg('alpha', 'sleep', timeout: 10)
+    wait_for_fg('alpha', 'sleep')
     assert_equal 'sleep', pane_fg('alpha')
   end
 
@@ -389,11 +398,7 @@ class DownTest < Minitest::Test
     refute Mxup::Tmux.has_session?(session)
   end
 
-  def test_noop_when_no_session_running
-    runner = runner_for(CONFIG)
-    out, = down!(runner)
-    assert_includes out, 'not running'
-  end
+  # test_noop_when_no_session_running: migrated to unit_test.rb (RunnerDownTest)
 end
 
 # ===========================================================================
@@ -520,128 +525,25 @@ end
 # Status — rendering
 # ===========================================================================
 
+# Only one status test needs a live tmux session: it verifies that status
+# correctly threads through end-to-end on a real server. All other status
+# assertions (MISSING/EXTRA/group layout/target lines/scrollback filtering)
+# are pure rendering and live in StatusViewTest under unit_test.rb.
 class StatusTest < Minitest::Test
   include IntegrationHelpers
 
-  def test_shows_session_name_windows_and_recent_output
+  def test_renders_live_session_with_running_command
     runner = runner_for(<<~YAML)
       windows:
         w: { root: /tmp, command: sleep 600 }
     YAML
     up!(runner)
-    wait_for_fg('w', 'sleep', timeout: 10)
+    wait_for_fg('w', 'sleep')
 
     out, = status!(runner)
     assert_includes out, "SESSION: #{session}"
     assert_includes out, '[0] w'
     assert_includes out, 'sleep'
-  end
-
-  def test_reports_when_session_not_running
-    runner = runner_for(<<~YAML)
-      windows:
-        w: { root: /tmp }
-    YAML
-
-    out, = status!(runner)
-    assert_includes out, 'NOT RUNNING'
-  end
-
-  def test_flags_missing_window
-    runner = runner_for(<<~YAML)
-      windows:
-        exists: { root: /tmp, command: sleep 600 }
-        gone:   { root: /tmp, command: sleep 600 }
-    YAML
-
-    Mxup::Tmux.new_session(session, 'exists', '/tmp')
-    Mxup::Tmux.send_keys(session, 'exists', 'sleep 600')
-
-    out, = status!(runner)
-    assert_includes out, 'gone'
-    assert_includes out, 'MISSING'
-  end
-
-  def test_flags_extra_window
-    runner = runner_for(<<~YAML)
-      windows:
-        declared: { root: /tmp, command: sleep 600 }
-    YAML
-
-    Mxup::Tmux.new_session(session, 'declared', '/tmp')
-    Mxup::Tmux.send_keys(session, 'declared', 'sleep 600')
-    Mxup::Tmux.new_window(session, 'undeclared', '/tmp')
-
-    out, = status!(runner)
-    assert_includes out, 'undeclared'
-    assert_includes out, '[NOT IN CONFIG]'
-  end
-
-  def test_shows_active_layout_and_group_membership
-    runner = runner_for(<<~YAML)
-      windows:
-        a: { root: /tmp, command: sleep 600 }
-        b: { root: /tmp, command: sleep 600 }
-      layouts:
-        full:
-          main: { panes: [a, b], split: even-horizontal }
-    YAML
-    up!(runner)
-    wait_for_fg('main', 'sleep', pane_index: 0, timeout: 10)
-
-    out, = status!(runner)
-    assert_includes out, 'layout: full'
-    assert_includes out, 'main'
-    assert_includes out, 'a, b'
-  end
-
-  def test_prints_target_address_for_standalone_window
-    runner = runner_for(<<~YAML)
-      windows:
-        w: { root: /tmp, command: sleep 600 }
-    YAML
-    up!(runner)
-
-    out, = status!(runner, lines: 2)
-    assert_includes out, "target: #{session}:w"
-  end
-
-  def test_prints_target_address_for_each_grouped_pane
-    runner = runner_for(<<~YAML)
-      windows:
-        alpha: { root: /tmp, command: sleep 600 }
-        beta:  { root: /tmp, command: sleep 600 }
-      layouts:
-        full:
-          svc: { panes: [alpha, beta], split: even-horizontal }
-    YAML
-    up!(runner)
-
-    out, = status!(runner, lines: 2)
-    assert_includes out, "target: #{session}:svc.0"
-    assert_includes out, "target: #{session}:svc.1"
-    assert_match(/^\s*alpha:\s*$/, out)
-    assert_match(/^\s*beta:\s*$/,  out)
-  end
-
-  def test_surfaces_content_that_scrolled_past_the_lines_window
-    # Emit a marker, then pad the pane with blank lines to push the marker
-    # past the requested status tail. Status should still find it via the
-    # full-scrollback filter.
-    Mxup::Tmux.new_session(session, 'w', '/tmp')
-    Mxup::Tmux.send_keys(session, 'w', 'echo UNIQUE_MARKER_XYZ')
-    wait_until(message: 'marker to appear') do
-      Mxup::Tmux.capture_pane(session, 'w', lines: 200).include?('UNIQUE_MARKER_XYZ')
-    end
-    Mxup::Tmux.send_keys(session, 'w', "printf '\\n%.0s' {1..200}")
-
-    runner = runner_for(<<~YAML)
-      windows:
-        w: { root: /tmp }
-    YAML
-
-    out, = status!(runner, lines: 10)
-    assert_includes out, 'UNIQUE_MARKER_XYZ'
   end
 end
 
@@ -706,7 +608,7 @@ class LayoutUpTest < Minitest::Test
 
     # Wait for all three sleep commands to become the foreground process —
     # this is the very thing the old test flaked on.
-    3.times { |i| wait_for_fg('grp', 'sleep', pane_index: i, timeout: 10) }
+    3.times { |i| wait_for_fg('grp', 'sleep', pane_index: i) }
 
     panes = panes_in('grp')
     assert_equal 3, panes.size
@@ -771,9 +673,9 @@ class LayoutSwitchTest < Minitest::Test
         flat: {}
     YAML
     up!(grouped)
-    wait_for_fg('main', 'sleep', pane_index: 0, timeout: 10)
-    wait_for_fg('main', 'sleep', pane_index: 1, timeout: 10)
-    wait_for_fg('c',    'sleep', timeout: 10)
+    wait_for_fg('main', 'sleep', pane_index: 0)
+    wait_for_fg('main', 'sleep', pane_index: 1)
+    wait_for_fg('c',    'sleep')
 
     pids_before = Mxup::Tmux.list_panes(session).map { |p| p[:pid] }.sort
 
@@ -797,7 +699,7 @@ class LayoutSwitchTest < Minitest::Test
           all: { panes: [a, b, c], split: tiled }
     YAML
     up!(flat)
-    3.times { |i| wait_for_fg(%w[a b c][i], 'sleep', timeout: 10) }
+    3.times { |i| wait_for_fg(%w[a b c][i], 'sleep') }
 
     compact = Mxup::Runner.new(config, layout: 'compact')
     capture_io { compact.switch_layout('compact') }
@@ -806,37 +708,8 @@ class LayoutSwitchTest < Minitest::Test
     assert_equal 3, Mxup::Tmux.pane_count(session, 'all')
   end
 
-  def test_switching_to_active_layout_is_a_noop
-    runner = runner_for(<<~YAML)
-      windows:
-        a: { root: /tmp, command: sleep 600 }
-      layouts:
-        full:
-          main: { panes: [a] }
-    YAML
-    up!(runner)
-
-    out, = capture_io { runner.switch_layout('full') }
-    assert_includes out, "Already using layout 'full'"
-  end
-
-  def test_show_layouts_prints_all_layouts_with_groups
-    runner = runner_for(<<~YAML)
-      windows:
-        a: { root: /tmp }
-        b: { root: /tmp }
-      layouts:
-        full:
-          main: { panes: [a, b], split: even-horizontal }
-        flat: {}
-    YAML
-
-    out, = capture_io { runner.show_layouts }
-    assert_includes out, 'full'
-    assert_includes out, 'flat'
-    assert_includes out, 'main=[a,b]'
-    assert_includes out, 'all standalone'
-  end
+  # test_switching_to_active_layout_is_a_noop:     moved to LayoutManagerShowTest (unit)
+  # test_show_layouts_prints_all_layouts_with_groups: moved to LayoutManagerShowTest (unit)
 
   def test_windows_follow_layout_declaration_order
     runner = runner_for(<<~YAML)
@@ -854,85 +727,9 @@ class LayoutSwitchTest < Minitest::Test
   end
 end
 
-# ===========================================================================
-# Target resolution — `mxup target`
-# ===========================================================================
-
-class TargetTest < Minitest::Test
-  include IntegrationHelpers
-
-  def test_prints_bare_window_for_standalone
-    runner = runner_for(<<~YAML)
-      windows:
-        solo: { root: /tmp, command: sleep 600 }
-    YAML
-    up!(runner)
-
-    out, = capture_io { runner.target(['solo']) }
-    assert_equal "#{session}:solo", out.strip
-  end
-
-  def test_prints_pane_address_inside_group
-    runner = runner_for(<<~YAML)
-      windows:
-        alpha: { root: /tmp, command: sleep 600 }
-        beta:  { root: /tmp, command: sleep 600 }
-        gamma: { root: /tmp, command: sleep 600 }
-      layouts:
-        full:
-          svc: { panes: [alpha, beta, gamma], split: tiled }
-    YAML
-    up!(runner)
-
-    {
-      'alpha' => "#{session}:svc.0",
-      'beta'  => "#{session}:svc.1",
-      'gamma' => "#{session}:svc.2"
-    }.each do |name, expected|
-      out, = capture_io { runner.target([name]) }
-      assert_equal expected, out.strip
-    end
-  end
-
-  def test_listing_all_windows_prints_tab_separated_table
-    runner = runner_for(<<~YAML)
-      windows:
-        alpha: { root: /tmp, command: sleep 600 }
-        beta:  { root: /tmp, command: sleep 600 }
-        solo:  { root: /tmp, command: sleep 600 }
-      layouts:
-        full:
-          grp: { panes: [alpha, beta], split: even-horizontal }
-    YAML
-    up!(runner)
-
-    out, = capture_io { runner.target([]) }
-    lines = out.strip.split("\n")
-    assert_equal 3, lines.size
-    assert_equal ['alpha', "#{session}:grp.0"], lines[0].split("\t", 2)
-    assert_equal ['beta',  "#{session}:grp.1"], lines[1].split("\t", 2)
-    assert_equal ['solo',  "#{session}:solo"],  lines[2].split("\t", 2)
-  end
-
-  def test_unknown_window_aborts
-    runner = runner_for(<<~YAML)
-      windows:
-        w: { root: /tmp, command: sleep 600 }
-    YAML
-    up!(runner)
-
-    assert_raises(SystemExit) { capture_io { runner.target(['does-not-exist']) } }
-  end
-
-  def test_aborts_when_session_not_running
-    runner = runner_for(<<~YAML)
-      windows:
-        w: { root: /tmp, command: sleep 600 }
-    YAML
-
-    assert_raises(SystemExit) { capture_io { runner.target([]) } }
-  end
-end
+# Target resolution (`mxup target`) is pure string-formatting over tmux
+# state; all five tests now live in unit_test.rb (RunnerTargetTest) with
+# stubbed Tmux methods.
 
 # ===========================================================================
 # Exec — run command in target pane with capture

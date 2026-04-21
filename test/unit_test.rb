@@ -685,3 +685,337 @@ class ConstantsTest < Minitest::Test
     end
   end
 end
+
+# ---------------------------------------------------------------------------
+# Runner#target — pure pane-address formatting; tested by stubbing Tmux state
+# ---------------------------------------------------------------------------
+
+class RunnerTargetTest < Minitest::Test
+  include TestHelpers::TmpDir
+  include TestHelpers::TmuxStubs
+
+  SESSION = 's'
+
+  def runner_for(yaml)
+    config = make_config("session: #{SESSION}\n#{yaml}")
+    Mxup::Runner.new(config)
+  end
+
+  def test_prints_bare_window_for_standalone
+    stub_tmux(
+      has_session?: true,
+      list_panes: [pane(name: 'solo')],
+      list_windows: [window(name: 'solo')]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        solo: { root: /tmp, command: sleep 600 }
+    YAML
+
+    out, = capture_io { runner.target(['solo']) }
+    assert_equal "#{SESSION}:solo", out.strip
+  end
+
+  def test_prints_pane_address_inside_group
+    stub_tmux(
+      has_session?: true,
+      list_windows: [window(name: 'svc')],
+      list_panes: [
+        pane(name: 'svc', pane_index: 0, title: 'alpha'),
+        pane(name: 'svc', pane_index: 1, title: 'beta'),
+        pane(name: 'svc', pane_index: 2, title: 'gamma')
+      ]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        alpha: { root: /tmp, command: sleep 600 }
+        beta:  { root: /tmp, command: sleep 600 }
+        gamma: { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          svc: { panes: [alpha, beta, gamma], split: tiled }
+    YAML
+
+    {
+      'alpha' => "#{SESSION}:svc.0",
+      'beta'  => "#{SESSION}:svc.1",
+      'gamma' => "#{SESSION}:svc.2"
+    }.each do |name, expected|
+      out, = capture_io { runner.target([name]) }
+      assert_equal expected, out.strip
+    end
+  end
+
+  def test_listing_all_windows_prints_tab_separated_table
+    stub_tmux(
+      has_session?: true,
+      list_windows: [window(name: 'grp'), window(name: 'solo', index: 1)],
+      list_panes: [
+        pane(name: 'grp',  pane_index: 0, title: 'alpha'),
+        pane(name: 'grp',  pane_index: 1, title: 'beta'),
+        pane(name: 'solo', pane_index: 0, window_index: 1)
+      ]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        alpha: { root: /tmp, command: sleep 600 }
+        beta:  { root: /tmp, command: sleep 600 }
+        solo:  { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          grp: { panes: [alpha, beta], split: even-horizontal }
+    YAML
+
+    out, = capture_io { runner.target([]) }
+    lines = out.strip.split("\n")
+    assert_equal 3, lines.size
+    assert_equal ['alpha', "#{SESSION}:grp.0"], lines[0].split("\t", 2)
+    assert_equal ['beta',  "#{SESSION}:grp.1"], lines[1].split("\t", 2)
+    assert_equal ['solo',  "#{SESSION}:solo"],  lines[2].split("\t", 2)
+  end
+
+  def test_unknown_window_aborts
+    stub_tmux(has_session?: true, list_windows: [window(name: 'w')],
+              list_panes: [pane(name: 'w')])
+
+    runner = runner_for(<<~YAML)
+      windows:
+        w: { root: /tmp, command: sleep 600 }
+    YAML
+
+    assert_raises(SystemExit) { capture_io { runner.target(['does-not-exist']) } }
+  end
+
+  def test_aborts_when_session_not_running
+    stub_tmux(has_session?: false)
+
+    runner = runner_for(<<~YAML)
+      windows:
+        w: { root: /tmp, command: sleep 600 }
+    YAML
+
+    assert_raises(SystemExit) { capture_io { runner.target([]) } }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# StatusView — rendering, driven by stubbed tmux state
+# ---------------------------------------------------------------------------
+
+class StatusViewTest < Minitest::Test
+  include TestHelpers::TmpDir
+  include TestHelpers::TmuxStubs
+
+  SESSION = 's'
+
+  def runner_for(yaml, layout: nil)
+    config = make_config("session: #{SESSION}\n#{yaml}")
+    Mxup::Runner.new(config, layout: layout)
+  end
+
+  def stub_running(panes:, windows: nil, layout: nil, capture: '')
+    wins = windows || panes.map { |p| window(name: p[:name], index: p[:window_index]) }.uniq
+    stub_tmux(
+      has_session?: true,
+      session_created: Time.now.to_i.to_s,
+      list_panes: panes,
+      list_windows: wins,
+      show_environment: layout,
+      capture_pane: capture
+    )
+  end
+
+  def test_reports_when_session_not_running
+    stub_tmux(has_session?: false)
+    runner = runner_for("windows:\n  w: { root: /tmp }\n")
+
+    out, = capture_io { runner.status(lines: 5) }
+    assert_includes out, 'NOT RUNNING'
+  end
+
+  def test_flags_missing_window
+    stub_running(panes: [pane(name: 'exists', fg_cmd: 'sleep')])
+
+    runner = runner_for(<<~YAML)
+      windows:
+        exists: { root: /tmp, command: sleep 600 }
+        gone:   { root: /tmp, command: sleep 600 }
+    YAML
+
+    out, = capture_io { runner.status(lines: 5) }
+    assert_includes out, 'gone'
+    assert_includes out, 'MISSING'
+  end
+
+  def test_flags_extra_window
+    stub_running(panes: [
+      pane(name: 'declared',   fg_cmd: 'sleep'),
+      pane(name: 'undeclared', window_index: 1, fg_cmd: 'bash')
+    ])
+
+    runner = runner_for(<<~YAML)
+      windows:
+        declared: { root: /tmp, command: sleep 600 }
+    YAML
+
+    out, = capture_io { runner.status(lines: 5) }
+    assert_includes out, 'undeclared'
+    assert_includes out, '[NOT IN CONFIG]'
+  end
+
+  def test_shows_active_layout_and_group_membership
+    stub_running(
+      layout: 'full',
+      panes: [
+        pane(name: 'main', pane_index: 0, title: 'a', fg_cmd: 'sleep'),
+        pane(name: 'main', pane_index: 1, title: 'b', fg_cmd: 'sleep')
+      ],
+      windows: [window(name: 'main')]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        a: { root: /tmp, command: sleep 600 }
+        b: { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          main: { panes: [a, b], split: even-horizontal }
+    YAML
+
+    out, = capture_io { runner.status(lines: 5) }
+    assert_includes out, 'layout: full'
+    assert_includes out, 'main'
+    assert_includes out, 'a, b'
+  end
+
+  def test_prints_target_address_for_standalone_window
+    stub_running(panes: [pane(name: 'w', fg_cmd: 'sleep')])
+    runner = runner_for(<<~YAML)
+      windows:
+        w: { root: /tmp, command: sleep 600 }
+    YAML
+
+    out, = capture_io { runner.status(lines: 2) }
+    assert_includes out, "target: #{SESSION}:w"
+  end
+
+  def test_prints_target_address_for_each_grouped_pane
+    stub_running(
+      layout: 'full',
+      panes: [
+        pane(name: 'svc', pane_index: 0, title: 'alpha', fg_cmd: 'sleep'),
+        pane(name: 'svc', pane_index: 1, title: 'beta',  fg_cmd: 'sleep')
+      ],
+      windows: [window(name: 'svc')]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        alpha: { root: /tmp, command: sleep 600 }
+        beta:  { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          svc: { panes: [alpha, beta], split: even-horizontal }
+    YAML
+
+    out, = capture_io { runner.status(lines: 2) }
+    assert_includes out, "target: #{SESSION}:svc.0"
+    assert_includes out, "target: #{SESSION}:svc.1"
+    assert_match(/^\s*alpha:\s*$/, out)
+    assert_match(/^\s*beta:\s*$/,  out)
+  end
+
+  def test_surfaces_content_that_scrolled_past_the_lines_window
+    # capture_pane returns a big scroll with the marker buried; StatusView
+    # filters blanks then tails, so as long as the marker lives in a
+    # non-blank line it should still show up.
+    scroll = "UNIQUE_MARKER_XYZ\n" + ("\n" * 200) + "bash$\n"
+    stub_running(
+      panes: [pane(name: 'w', fg_cmd: 'bash')],
+      capture: scroll
+    )
+
+    runner = runner_for("windows:\n  w: { root: /tmp }\n")
+
+    out, = capture_io { runner.status(lines: 10) }
+    assert_includes out, 'UNIQUE_MARKER_XYZ'
+  end
+end
+
+# ---------------------------------------------------------------------------
+# LayoutManager.show / no-op switch — pure rendering, stubbed tmux
+# ---------------------------------------------------------------------------
+
+class LayoutManagerShowTest < Minitest::Test
+  include TestHelpers::TmpDir
+  include TestHelpers::TmuxStubs
+
+  def runner_for(yaml)
+    Mxup::Runner.new(make_config("session: s\n#{yaml}"))
+  end
+
+  def test_show_layouts_prints_all_layouts_with_groups
+    stub_tmux(has_session?: false)
+
+    runner = runner_for(<<~YAML)
+      windows:
+        a: { root: /tmp }
+        b: { root: /tmp }
+      layouts:
+        full:
+          main: { panes: [a, b], split: even-horizontal }
+        flat: {}
+    YAML
+
+    out, = capture_io { runner.show_layouts }
+    assert_includes out, 'full'
+    assert_includes out, 'flat'
+    assert_includes out, 'main=[a,b]'
+    assert_includes out, 'all standalone'
+  end
+
+  def test_switching_to_active_layout_is_a_noop
+    stub_tmux(
+      has_session?: true,
+      show_environment: 'full',
+      list_panes: [pane(name: 'main', pane_index: 0, title: 'a', fg_cmd: 'sleep')],
+      list_windows: [window(name: 'main')]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        a: { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          main: { panes: [a] }
+    YAML
+
+    out, = capture_io { runner.switch_layout('full') }
+    assert_includes out, "Already using layout 'full'"
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Runner#down — fast branches that don't need a real session
+# ---------------------------------------------------------------------------
+
+class RunnerDownTest < Minitest::Test
+  include TestHelpers::TmpDir
+  include TestHelpers::TmuxStubs
+
+  def test_noop_when_no_session_running
+    stub_tmux(has_session?: false)
+
+    runner = Mxup::Runner.new(make_config(<<~YAML))
+      session: s
+      windows:
+        w: { root: /tmp, command: sleep 600 }
+    YAML
+
+    out, = capture_io { runner.down }
+    assert_includes out, 'not running'
+  end
+end

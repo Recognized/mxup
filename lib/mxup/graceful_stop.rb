@@ -4,6 +4,18 @@ module Mxup
   # Sends SIGINT to every non-shell pane in a session, then waits for them to
   # exit. Used by `mxup down` before the final kill-session.
   class GracefulStop
+    # Interval (seconds) between SIGINT rounds. Overridable for tests that
+    # don't want to pay the 1s settle between retries.
+    DEFAULT_ROUND_INTERVAL = 1.0
+
+    class << self
+      attr_writer :round_interval
+
+      def round_interval
+        @round_interval || DEFAULT_ROUND_INTERVAL
+      end
+    end
+
     def initialize(session, out: nil, err: nil)
       @session      = session
       @out_override = out
@@ -47,7 +59,7 @@ module Mxup
         end
 
         round += 1
-        sleep 1
+        sleep GracefulStop.round_interval
       end
     end
 

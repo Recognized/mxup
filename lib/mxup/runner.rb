@@ -4,6 +4,20 @@ module Mxup
   # Public programmatic API. Composes the focused helpers — nothing here
   # should contain real business logic, only wiring and delegation.
   class Runner
+    # Delay (seconds) between the two Ctrl-C presses during a restart, and
+    # between Ctrl-C and sending the new command. In production 1s is enough
+    # to let the pane's shell redraw its prompt; tests shorten this to avoid
+    # paying multi-second waits for a purely cosmetic settle.
+    DEFAULT_INTERRUPT_DELAY = 1.0
+
+    class << self
+      attr_writer :interrupt_delay
+
+      def interrupt_delay
+        @interrupt_delay || DEFAULT_INTERRUPT_DELAY
+      end
+    end
+
     def initialize(config, dry_run: false, layout: nil)
       @config  = config
       @session = config.session
@@ -102,10 +116,11 @@ module Mxup
       end
       # Two C-c's handle both "foreground is command" and "foreground is a
       # sub-prompt waiting on input"; the sleep gives the shell time to redraw.
+      delay = Runner.interrupt_delay
       Tmux.send_interrupt(@session, target_ref)
-      sleep 1
+      sleep delay
       Tmux.send_interrupt(@session, target_ref)
-      sleep 1
+      sleep delay
       Tmux.send_keys(@session, target_ref, launcher.command_for(win))
       $stdout.puts "  #{win.name}: restarted"
     end

@@ -1,59 +1,82 @@
 ---
-description: mxup project overview — declarative tmux session manager
+description: mxup — declarative tmux session manager; use for starting / restarting / running commands in tmux panes
 alwaysApply: true
 ---
 
 # mxup
 
-**Declarative tmux session manager with reconciliation.** Given a YAML
-config, `mxup up` brings the live tmux session into agreement with it:
-creates missing windows, restarts crashed ones, removes undeclared ones,
-and leaves healthy processes alone. Idempotent; re-running `up` is safe.
+**Declarative tmux session manager with reconciliation.** A YAML file
+describes windows, commands, layouts. `mxup up` brings the live tmux
+session into agreement with it: creates missing, restarts crashed,
+removes undeclared, leaves healthy alone. Idempotent — re-running `up`
+is safe.
 
-## Layout
-
-- `bin/mxup` — thin entrypoint → `Mxup::CLI`.
-- `lib/mxup/` — one concern per file: `config`, `tmux` (shell wrapper),
-  `launcher` (per-window scripts), `pane_resolver`, `reconciler`,
-  `layout_manager`, `status_view`, `exec_runner`, `graceful_stop`,
-  `process_probe`, `runner` (facade).
-- `test/unit_test.rb` — pure logic; stubs `Mxup::Tmux` via `TestHelpers::TmuxStubs`.
-- `test/integration_test.rb` — private tmux server via `TMUX_TMPDIR` + `tmux -f`.
+Configs live in `~/.config/mxup/<name>.yml` (or pass `-f <path>`).
 
 ## Commands
 
-`up [name]` (default), `status`, `down`, `restart [name:]w1,w2`,
-`layout [name] <layout>` (PIDs survive), `target [name:]<window>`,
-`exec -t <target> "<cmd>"` (runs, waits, captures output, exits with rc).
-All accept `-f <path>` and `--dry-run` where meaningful.
+```
+mxup up [name]                     # reconcile (default when no subcommand)
+mxup status [name]                 # per-window status + recent output
+mxup down [name]                   # graceful stop + kill-session
+mxup restart [name:]w1,w2          # restart specific windows
+mxup restart [name]                # restart all windows
+mxup layout [name] <layout>        # switch layout, preserves running PIDs
+mxup target [name:]<window>        # print tmux target for a logical name
+mxup exec -t <target> "<cmd>"      # run + wait + capture output + exit rc
+```
+
+Flags: `-f <path>` (explicit config), `--dry-run`, `--layout NAME` (for
+`up`), `--timeout N` + `--force` + `-q` (for `exec`).
+
+## Prefer `mxup exec` for running commands in a pane
+
+Instead of the manual `tmux send-keys … tmux wait-for … tmux capture-pane`
+dance, use `mxup exec`. It resolves logical names, blocks until the
+command finishes, prints captured output, and exits with the command's
+real return code:
+
+```bash
+mxup exec -t my-proj:backend "./gradlew test 2>&1 | tail -n 30"
+echo "exit: $?"
+```
+
+It refuses to target a pane running a non-shell process unless `--force`
+is passed. Use `--timeout N` to avoid hanging (exits 124 on timeout).
 
 ## Config shape
 
 ```yaml
 session: my-proj
+setup: |                            # optional; runs in every window before its command
+  eval "$(direnv export bash)"
 windows:
-  web:
+  db:
     root: ~/app
-    command: npm run dev
-    wait_for: localhost:5432     # shorthand = tcp; also {http,path,script}
-    env: { NODE_ENV: production }
-layouts:                          # optional
+    command: docker compose up postgres
+  backend:
+    root: ~/app/backend
+    wait_for: localhost:5432        # shorthand = tcp; also { http:, path:, script: }
+    env: { DATABASE_URL: postgres://localhost/myapp_dev }
+    command: ./start.sh
+  shell:                            # no `command` → interactive shell
+    root: ~/app
+
+layouts:                            # optional; first is default, override with --layout
   full:
-    svc: { panes: [db, web], split: even-horizontal }
+    services: { panes: [db, backend], split: even-horizontal }
+  flat: {}                          # empty → all windows standalone
 ```
 
-## Reconciliation contract
+Window fields: `root` (required, supports `~`), `command`, `env`,
+`wait_for`. Expanded `wait_for` forms accept `timeout` + `interval` +
+`label`.
 
-When touching `reconciler.rb` / `layout_manager.rb`, preserve:
-- missing → created; extra → killed with warning; idle → command re-sent;
-  healthy → untouched.
-- Layout switches flatten panes then regroup, preserving PIDs.
-- `Mxup::Tmux.break_pane` must pin `-t <session>:` or windows leak into
-  the caller's session.
+## When editing a consumer's mxup config
 
-## Tests
-
-`rake unit` (~0.4s, no tmux), `rake integration` (~7s, private server),
-`rake` (both). Integration shortens production sleeps via
-`Mxup::Runner.interrupt_delay` and `Mxup::GracefulStop.round_interval` —
-don't reintroduce hardcoded sleeps; plumb a knob through instead.
+- Preserve window declaration order — it drives pane/window order.
+- A window without `command` is an interactive shell (useful for scratch
+  panes).
+- Changing `wait_for`, `env`, or `command` takes effect on the next
+  `mxup restart <window>` or `mxup up` after the pane goes idle — `up`
+  alone won't restart a still-running healthy process.

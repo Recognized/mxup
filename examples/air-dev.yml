@@ -16,8 +16,7 @@
 session: air-dev
 
 setup: |
-  source ~/.zshrc
-  direnv allow
+  eval "$(direnv export zsh)"
   unset AIR_BACKEND_APP_AUTH__ADDITIONALAUDIENCES
 
 windows:

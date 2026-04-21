@@ -205,15 +205,59 @@ mxup layout my-project compact
 | `mxup restart [name]` | Restart all windows in the session |
 | `mxup layout [name]` | Show available layouts and which is active |
 | `mxup layout [name] <layout>` | Switch to a different layout (preserves running processes) |
+| `mxup target [name:]<window>` | Print the tmux target (`session:window.pane`) for a logical window |
+| `mxup target [name]` | Print targets for every declared window (tab-separated) |
+| `mxup exec -t [name:]<window> "<cmd>"` | Run `<cmd>` in a pane, wait for completion, print output, exit with its status |
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `-f path` | Use a specific config file |
-| `--dry-run` | Preview changes without applying (for `up` and `restart`) |
-| `--lines N` | Number of output lines to show per window (for `status`, default 15) |
+| `--dry-run` | Preview changes without applying (for `up`, `restart`, `exec`) |
+| `--lines N` | Output lines to show (for `status` default 15, for `exec` default 50) |
 | `--layout NAME` | Layout to use (for `up`) |
+| `-t TARGET` | Pane target (for `exec`); accepts `name:window`, `window`, or `window.pane` |
+| `--timeout N` | Max seconds to wait for the command (for `exec`; exit 124 on timeout) |
+| `--force` | Send the command even if the pane is busy with another process (for `exec`) |
+| `-q`, `--quiet` | Don't print captured output (for `exec`) |
+
+### Running one-off commands in a pane (`mxup exec`)
+
+`mxup exec` is a shortcut for the common "send a command to a tmux pane, wait
+for it to finish, and show the output" loop. It handles the three annoying
+parts for you:
+
+1. **Resolving logical names to real tmux targets** — `air-backend` may actually
+   live as pane `services.1`; `mxup exec -t air-dev:air-backend` figures that
+   out via the active layout.
+2. **Waiting for the command to finish** — uses `tmux wait-for` with a unique
+   marker under the hood, so `exec` blocks until the command actually exits.
+3. **Capturing output and exit status** — prints the last `--lines N` lines of
+   the pane and exits with the command's own exit code.
+
+So instead of the verbose recipe:
+
+```bash
+MARKER="fulltest-$(date +%s%N)"
+tmux send-keys -t air-dev:scratch \
+  "./gradlew test 2>&1 | tail -n 30; echo FULLTEST_EXIT=\$?; tmux wait-for -S $MARKER" Enter \
+  && tmux wait-for $MARKER
+tmux capture-pane -t air-dev:scratch -p -S -50
+```
+
+you write:
+
+```bash
+mxup exec -t air-dev:scratch "./gradlew test 2>&1 | tail -n 30"
+echo "exit: $?"
+```
+
+The user command is wrapped in a subshell, so `exit`, `set -e`, or a failing
+command won't kill the pane's interactive shell. By default `exec` refuses to
+send to a pane that's currently running a non-shell process — pass `--force`
+to override. Use `--timeout N` to avoid hanging indefinitely on a runaway
+command (exits 124 on timeout).
 
 ## Reconciliation
 

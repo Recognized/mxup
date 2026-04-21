@@ -884,4 +884,360 @@ class IntegrationTest < Minitest::Test
 
     assert_equal %w[main c], names
   end
+
+  # --- Target resolution ---
+
+  def test_target_prints_session_window_for_standalone
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        solo:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.target(['solo']) }
+    assert_equal "#{SESSION}:solo", out.strip
+  end
+
+  def test_target_prints_pane_address_for_grouped_window
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        alpha:
+          root: /tmp
+          command: sleep 600
+        beta:
+          root: /tmp
+          command: sleep 600
+        gamma:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          svc:
+            panes: [alpha, beta, gamma]
+            split: tiled
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.target(['alpha']) }
+    assert_equal "#{SESSION}:svc.0", out.strip
+
+    out, = capture_io { runner.target(['beta']) }
+    assert_equal "#{SESSION}:svc.1", out.strip
+
+    out, = capture_io { runner.target(['gamma']) }
+    assert_equal "#{SESSION}:svc.2", out.strip
+  end
+
+  def test_target_listing_all_windows
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        alpha:
+          root: /tmp
+          command: sleep 600
+        beta:
+          root: /tmp
+          command: sleep 600
+        solo:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          grp:
+            panes: [alpha, beta]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.target([]) }
+    lines = out.strip.split("\n")
+    assert_equal 3, lines.size
+    assert_equal ['alpha', "#{SESSION}:grp.0"], lines[0].split("\t", 2)
+    assert_equal ['beta',  "#{SESSION}:grp.1"], lines[1].split("\t", 2)
+    assert_equal ['solo',  "#{SESSION}:solo"],  lines[2].split("\t", 2)
+  end
+
+  def test_target_unknown_window_aborts
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        w:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    assert_raises(SystemExit) do
+      capture_io { runner.target(['does-not-exist']) }
+    end
+  end
+
+  def test_target_when_session_not_running
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        w:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+
+    assert_raises(SystemExit) do
+      capture_io { runner.target([]) }
+    end
+  end
+
+  def test_status_prints_target_for_standalone
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        w:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.status(lines: 2) }
+    assert_includes out, "target: #{SESSION}:w"
+  end
+
+  def test_status_finds_content_that_scrolled_past_requested_window
+    # Emit a unique marker early, then pad the pane with many blank lines so
+    # the marker sits well above the bottom -lines window. The status output
+    # should still surface the marker because capture-pane now reads the full
+    # scrollback and filters whitespace-only lines.
+    Mxup::Tmux.new_session(SESSION, 'w', '/tmp')
+    Mxup::Tmux.send_keys(SESSION, 'w', 'echo UNIQUE_MARKER_XYZ')
+    sleep 0.5
+    # 200 blank-ish lines of padding via printf newlines
+    Mxup::Tmux.send_keys(SESSION, 'w', "printf '\\n%.0s' {1..200}")
+    sleep 1
+
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        w:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    out, = capture_io { runner.status(lines: 10) }
+    assert_includes out, 'UNIQUE_MARKER_XYZ'
+  end
+
+  # --- Exec ---
+
+  # exec terminates the process via `exit(rc)`. Wrap so we can collect both
+  # the captured I/O and the resulting status in a single invocation.
+  def run_exec(runner, *args, **kwargs)
+    status = nil
+    out, err = capture_io do
+      begin
+        runner.exec(*args, **kwargs)
+      rescue SystemExit => e
+        status = e.status
+      end
+    end
+    [out, err, status]
+  end
+
+  def test_exec_runs_command_and_captures_output
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 0.3
+
+    out, _err, status = run_exec(runner, 'scratch', 'echo mxup-exec-marker-xyz')
+    assert_equal 0, status
+    assert_includes out, 'mxup-exec-marker-xyz'
+  end
+
+  def test_exec_propagates_non_zero_exit_code
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 0.3
+
+    _out, _err, status = run_exec(runner, 'scratch', 'exit 7')
+    assert_equal 7, status
+  end
+
+  def test_exec_accepts_session_prefixed_target
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 0.3
+
+    out, _err, status = run_exec(runner, "#{SESSION}:scratch", 'echo via-prefixed-target')
+    assert_equal 0, status
+    assert_includes out, 'via-prefixed-target'
+  end
+
+  def test_exec_resolves_logical_name_in_pane_group
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        alpha:
+          root: /tmp
+        beta:
+          root: /tmp
+      layouts:
+        full:
+          grp:
+            panes: [alpha, beta]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 0.5
+
+    out, _err, status = run_exec(runner, 'beta', 'echo output-from-beta-pane')
+    assert_equal 0, status
+    assert_includes out, 'output-from-beta-pane'
+  end
+
+  def test_exec_rejects_busy_pane_without_force
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        busy:
+          root: /tmp
+          command: sleep 600
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    wait_for_process('busy', 'sleep', timeout: 5)
+
+    assert_raises(SystemExit) do
+      capture_io { runner.exec('busy', 'echo should-not-run') }
+    end
+  end
+
+  def test_exec_rejects_mismatched_session_prefix
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    assert_raises(SystemExit) do
+      capture_io { runner.exec('other-session:scratch', 'echo nope') }
+    end
+  end
+
+  def test_exec_times_out_when_command_runs_too_long
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+    sleep 0.3
+
+    _out, _err, status = run_exec(runner, 'scratch', 'sleep 30', timeout: 1)
+    assert_equal 124, status
+  end
+
+  def test_exec_dry_run_does_not_block
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        scratch:
+          root: /tmp
+    YAML
+
+    config = Mxup::Config.new(path)
+    # Real session so dry-run exec passes the "session running" gate.
+    live = Mxup::Runner.new(config)
+    capture_io { live.up }
+
+    dry = Mxup::Runner.new(config, dry_run: true)
+    # Would block forever if we actually tried to wait_for a marker.
+    out, _err = capture_io { dry.exec('scratch', 'sleep 30') }
+    assert_includes out, '[dry-run]'
+  end
+
+  def test_status_prints_target_for_grouped_panes
+    path = write_config(<<~YAML)
+      session: #{SESSION}
+      windows:
+        alpha:
+          root: /tmp
+          command: sleep 600
+        beta:
+          root: /tmp
+          command: sleep 600
+      layouts:
+        full:
+          svc:
+            panes: [alpha, beta]
+            split: even-horizontal
+    YAML
+
+    config = Mxup::Config.new(path)
+    runner = Mxup::Runner.new(config)
+    capture_io { runner.up }
+
+    out, = capture_io { runner.status(lines: 2) }
+    assert_includes out, "target: #{SESSION}:svc.0"
+    assert_includes out, "target: #{SESSION}:svc.1"
+    assert_match(/^\s*alpha:\s*$/, out)
+    assert_match(/^\s*beta:\s*$/,  out)
+  end
 end

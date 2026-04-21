@@ -7,6 +7,8 @@ require 'optparse'
 require 'shellwords'
 require 'set'
 require 'fileutils'
+require 'tmpdir'
+require 'timeout'
 
 module Mxup
   VERSION = '0.1.0'
@@ -232,8 +234,13 @@ module Mxup
       system("tmux swap-window -s #{esc(session)}:#{idx_a} -t #{esc(session)}:#{idx_b}")
     end
 
-    def capture_pane(session, target, lines)
-      `tmux capture-pane -t #{esc(session)}:#{esc(target)} -p -S -#{lines} 2>/dev/null`
+    # Capture the pane's full scrollback (all history tmux still has) plus the
+    # visible screen. The caller is responsible for picking the tail it wants.
+    # We deliberately don't bound the start at -lines, because if the process
+    # printed its interesting output early and has been idle since, -S -lines
+    # would only see blank prompt padding and miss the real content.
+    def capture_pane(session, target, _lines = nil)
+      `tmux capture-pane -t #{esc(session)}:#{esc(target)} -p -S - 2>/dev/null`
     end
 
     def pane_count(session, window)
@@ -302,9 +309,10 @@ module Mxup
             pane = group_panes.find { |p| p[:title] == wn } ||
                    group_panes.find { |p| p[:pane_index] == idx }
             if pane.nil?
-              puts "    pane #{idx} (#{wn}): MISSING"
+              puts "  #{wn}: MISSING"
               next
             end
+            puts "  #{wn}:"
             print_pane_status(pane, wn, lines, indent: '    ')
           end
           puts
@@ -416,6 +424,107 @@ module Mxup
       puts "Layout switched to '#{target_layout}'."
     end
 
+    def target(window_names)
+      abort "Session #{@session} is not running." unless Tmux.has_session?(@session)
+      layout = active_layout_name
+
+      requested = Array(window_names).flat_map { |n| n.split(',') }.reject(&:empty?)
+
+      if requested.empty?
+        @config.windows.each do |win|
+          t = resolve_pane_target(win.name, layout)
+          if t
+            puts "#{win.name}\t#{@session}:#{t}"
+          else
+            puts "#{win.name}\t(not running)"
+          end
+        end
+      else
+        requested.each do |wn|
+          @config.windows.find { |w| w.name == wn } ||
+            abort("Window '#{wn}' not found in config.")
+          t = resolve_pane_target(wn, layout)
+          abort("Window '#{wn}' is not currently in the session.") unless t
+          if requested.size == 1
+            puts "#{@session}:#{t}"
+          else
+            puts "#{wn}\t#{@session}:#{t}"
+          end
+        end
+      end
+    end
+
+    # Run a command in a specific pane, wait for it to finish, capture output.
+    #
+    # Replaces the verbose pattern:
+    #   MARKER="..."; tmux send-keys -t X "cmd; tmux wait-for -S $MARKER" Enter \
+    #     && tmux wait-for $MARKER; tmux capture-pane -t X -p -S -50
+    #
+    # target_spec may be:
+    #   - "session:window"       (session must match config)
+    #   - "window"               (logical name from config, or a raw tmux window)
+    #   - "window.pane_index"    (raw tmux pane address)
+    def exec(target_spec, command, lines: 50, timeout: nil, force: false, quiet: false)
+      abort "Session #{@session} is not running." unless Tmux.has_session?(@session)
+      abort 'mxup exec: command is required.' if command.nil? || command.strip.empty?
+
+      window_part = if target_spec.include?(':')
+                      sess, rest = target_spec.split(':', 2)
+                      abort "Target session '#{sess}' does not match config session '#{@session}'." if sess != @session
+                      rest
+                    else
+                      target_spec
+                    end
+
+      resolved = resolve_exec_target(window_part)
+      abort "Target '#{window_part}' not found in session '#{@session}'." unless resolved
+      full_target = "#{@session}:#{resolved}"
+
+      unless force
+        pane = pane_for_target(resolved)
+        if pane && !SHELLS.include?(pane[:fg_cmd])
+          abort "Target pane #{full_target} is busy (#{pane[:fg_cmd]}). Pass --force to send anyway."
+        end
+      end
+
+      if @dry_run
+        puts "[dry-run] Would exec on #{full_target}: #{command}"
+        return 0
+      end
+
+      marker = "mxup-exec-#{Process.pid}-#{Time.now.to_i}-#{rand(10**9)}"
+      exit_file = File.join(Dir.tmpdir, "#{marker}.rc")
+      FileUtils.rm_f(exit_file)
+
+      cmd_clean = command.strip.sub(/;+\s*\z/, '')
+      # Wrap in a subshell so `exit N` or `set -e` inside the user command
+      # can't kill the pane's interactive shell and strand us waiting for
+      # the marker.
+      wrapped = "( #{cmd_clean} ); __mxup_rc=$?; echo $__mxup_rc > #{Shellwords.escape(exit_file)}; tmux wait-for -S #{Shellwords.escape(marker)}"
+
+      unless system("tmux send-keys -t #{Tmux.esc(full_target)} #{Shellwords.escape(wrapped)} Enter")
+        abort "Failed to send command to #{full_target}."
+      end
+
+      timed_out = wait_for_marker(marker, timeout)
+
+      output = `tmux capture-pane -t #{Tmux.esc(full_target)} -p -S -#{lines.to_i}`
+      unless quiet
+        print output
+        puts unless output.end_with?("\n")
+      end
+
+      if timed_out
+        warn "[mxup] exec: timed out after #{timeout}s waiting for command on #{full_target}."
+        FileUtils.rm_f(exit_file)
+        exit 124
+      end
+
+      rc = read_exit_code(exit_file)
+      FileUtils.rm_f(exit_file)
+      exit(rc || 0)
+    end
+
     def show_layouts
       active = Tmux.has_session?(@session) ? active_layout_name : nil
       if @config.layout_names.empty?
@@ -455,6 +564,65 @@ module Mxup
       else
         @config.default_layout
       end
+    end
+
+    def resolve_exec_target(window_part)
+      layout = active_layout_name
+
+      if @config.windows.any? { |w| w.name == window_part }
+        resolved = resolve_pane_target(window_part, layout)
+        return resolved if resolved
+      end
+
+      if window_part =~ /\A(.+)\.\d+\z/
+        return window_part if Tmux.list_windows(@session).map { |w| w[:name] }.include?(Regexp.last_match(1))
+      end
+
+      existing = Tmux.list_windows(@session).map { |w| w[:name] }
+      return window_part if existing.include?(window_part)
+
+      nil
+    end
+
+    def pane_for_target(target)
+      if target =~ /\A(.+)\.(\d+)\z/
+        win_name = Regexp.last_match(1)
+        pane_idx = Regexp.last_match(2).to_i
+        Tmux.list_panes(@session).find { |p| p[:name] == win_name && p[:pane_index] == pane_idx }
+      else
+        Tmux.list_panes(@session).find { |p| p[:name] == target && p[:pane_index] == 0 }
+      end
+    end
+
+    def wait_for_marker(marker, timeout)
+      if timeout.nil?
+        system("tmux wait-for #{Tmux.esc(marker)}")
+        return false
+      end
+
+      pid = Process.spawn("tmux wait-for #{Tmux.esc(marker)}")
+      begin
+        Timeout.timeout(timeout) { Process.waitpid(pid) }
+        false
+      rescue Timeout::Error
+        begin
+          Process.kill('TERM', pid)
+        rescue StandardError
+        end
+        begin
+          Process.waitpid(pid)
+        rescue StandardError
+        end
+        # Release any other waiters on this marker.
+        system("tmux wait-for -S #{Tmux.esc(marker)} 2>/dev/null")
+        true
+      end
+    end
+
+    def read_exit_code(path)
+      return nil unless File.exist?(path)
+      val = File.read(path).strip
+      val.empty? ? nil : val.to_i
     end
 
     def resolve_pane_target(window_name, layout_name)
@@ -877,12 +1045,14 @@ module Mxup
                      "#{indent}started: #{started}"
                    end
 
+      in_group = pane[:name] != logical_name
+      target = in_group ? Tmux.pane_target(pane[:name], pane[:pane_index]) : pane[:name]
+      puts "#{indent}target: #{@session}:#{target}"
       puts "#{indent}cwd: #{pane[:cwd]}"
       puts "#{indent}#{status_str}"
 
-      target = pane[:pane_index] > 0 ? Tmux.pane_target(pane[:name], pane[:pane_index]) : pane[:name]
-      output = Tmux.capture_pane(@session, target, lines)
-        .split("\n").reject(&:empty?).last(lines)
+      output = Tmux.capture_pane(@session, target)
+        .split("\n").reject { |l| l.strip.empty? }.last(lines)
       unless output.empty?
         puts "#{indent}--- last output (up to #{lines} lines) ---"
         output.each { |l| puts "#{indent}#{l}" }
@@ -909,14 +1079,19 @@ module Mxup
   class CLI
     def run(argv)
       args = argv.dup
-      options = { dry_run: false, config: nil, lines: 2, layout: nil }
+      options = { dry_run: false, config: nil, lines: nil, layout: nil,
+                  target: nil, timeout: nil, force: false, quiet: false }
 
       parser = OptionParser.new do |opts|
         opts.banner = "Usage: mxup [command] [name] [options]"
         opts.on('-f', '--file FILE', 'Config file path') { |f| options[:config] = f }
         opts.on('--dry-run', 'Preview changes without applying') { options[:dry_run] = true }
-        opts.on('--lines N', Integer, 'Output lines per window (status)') { |n| options[:lines] = n }
+        opts.on('--lines N', Integer, 'Output lines (status/exec)') { |n| options[:lines] = n }
         opts.on('--layout NAME', 'Layout to use (for up/layout commands)') { |l| options[:layout] = l }
+        opts.on('-t', '--target TARGET', 'Target window/pane for exec (e.g. name:window)') { |t| options[:target] = t }
+        opts.on('--timeout N', Integer, 'Timeout in seconds (for exec)') { |n| options[:timeout] = n }
+        opts.on('--force', 'Force exec on a busy pane') { options[:force] = true }
+        opts.on('-q', '--quiet', 'Suppress captured output (for exec)') { options[:quiet] = true }
         opts.on('-v', '--version', 'Show version') { puts "mxup #{VERSION}"; exit }
         opts.on('-h', '--help', 'Show help') { puts opts; exit }
       end
@@ -926,25 +1101,25 @@ module Mxup
       command = 'up'
       if args.first && !args.first.include?('.yml') && !args.first.include?('/')
         maybe_cmd = args.first
-        if %w[up status down restart layout].include?(maybe_cmd)
+        if %w[up status down restart layout target exec].include?(maybe_cmd)
           command = args.shift
         end
       end
 
       case command
-      when 'restart'
-        target = args.shift
-        if target&.include?(':')
-          name, windows_str = target.split(':', 2)
+      when 'restart', 'target'
+        spec = args.shift
+        if spec&.include?(':')
+          name, windows_str = spec.split(':', 2)
           window_names = windows_str ? windows_str.split(',') : []
-        elsif target
-          candidate = File.join(CONFIG_DIR, "#{target}.yml")
-          if File.exist?(candidate) || (options[:config] && target !~ /,/)
-            name = target
+        elsif spec
+          candidate = File.join(CONFIG_DIR, "#{spec}.yml")
+          if File.exist?(candidate) || (options[:config] && spec !~ /,/)
+            name = spec
             window_names = args
           else
             name = nil
-            window_names = [target] + args
+            window_names = [spec] + args
           end
         else
           name = nil
@@ -952,7 +1127,11 @@ module Mxup
         end
         config = load_config(options[:config], name)
         runner = Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
-        runner.restart(window_names)
+        if command == 'restart'
+          runner.restart(window_names)
+        else
+          runner.target(window_names)
+        end
 
       when 'layout'
         name = args.shift
@@ -965,6 +1144,21 @@ module Mxup
           runner.show_layouts
         end
 
+      when 'exec'
+        target = options[:target] || args.shift
+        abort 'Usage: mxup exec -t [name:]WINDOW "command"' if target.nil? || target.empty?
+        command_str = args.shift
+        abort 'Usage: mxup exec -t [name:]WINDOW "command"' if command_str.nil?
+
+        name = target.include?(':') ? target.split(':', 2).first : nil
+        config = load_config(options[:config], name)
+        runner = Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
+        runner.exec(target, command_str,
+                    lines: options[:lines] || 50,
+                    timeout: options[:timeout],
+                    force: options[:force],
+                    quiet: options[:quiet])
+
       when 'up', 'status', 'down'
         name = args.shift
         config = load_config(options[:config], name)
@@ -972,12 +1166,12 @@ module Mxup
 
         case command
         when 'up'     then runner.up
-        when 'status' then runner.status(lines: options[:lines])
+        when 'status' then runner.status(lines: options[:lines] || 2)
         when 'down'   then runner.down
         end
 
       else
-        abort "Unknown command: #{command}. Use: up, status, down, restart, layout"
+        abort "Unknown command: #{command}. Use: up, status, down, restart, layout, target, exec"
       end
     end
 

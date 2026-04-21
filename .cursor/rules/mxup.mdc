@@ -1,0 +1,59 @@
+---
+description: mxup project overview — declarative tmux session manager
+alwaysApply: true
+---
+
+# mxup
+
+**Declarative tmux session manager with reconciliation.** Given a YAML
+config, `mxup up` brings the live tmux session into agreement with it:
+creates missing windows, restarts crashed ones, removes undeclared ones,
+and leaves healthy processes alone. Idempotent; re-running `up` is safe.
+
+## Layout
+
+- `bin/mxup` — thin entrypoint → `Mxup::CLI`.
+- `lib/mxup/` — one concern per file: `config`, `tmux` (shell wrapper),
+  `launcher` (per-window scripts), `pane_resolver`, `reconciler`,
+  `layout_manager`, `status_view`, `exec_runner`, `graceful_stop`,
+  `process_probe`, `runner` (facade).
+- `test/unit_test.rb` — pure logic; stubs `Mxup::Tmux` via `TestHelpers::TmuxStubs`.
+- `test/integration_test.rb` — private tmux server via `TMUX_TMPDIR` + `tmux -f`.
+
+## Commands
+
+`up [name]` (default), `status`, `down`, `restart [name:]w1,w2`,
+`layout [name] <layout>` (PIDs survive), `target [name:]<window>`,
+`exec -t <target> "<cmd>"` (runs, waits, captures output, exits with rc).
+All accept `-f <path>` and `--dry-run` where meaningful.
+
+## Config shape
+
+```yaml
+session: my-proj
+windows:
+  web:
+    root: ~/app
+    command: npm run dev
+    wait_for: localhost:5432     # shorthand = tcp; also {http,path,script}
+    env: { NODE_ENV: production }
+layouts:                          # optional
+  full:
+    svc: { panes: [db, web], split: even-horizontal }
+```
+
+## Reconciliation contract
+
+When touching `reconciler.rb` / `layout_manager.rb`, preserve:
+- missing → created; extra → killed with warning; idle → command re-sent;
+  healthy → untouched.
+- Layout switches flatten panes then regroup, preserving PIDs.
+- `Mxup::Tmux.break_pane` must pin `-t <session>:` or windows leak into
+  the caller's session.
+
+## Tests
+
+`rake unit` (~0.4s, no tmux), `rake integration` (~7s, private server),
+`rake` (both). Integration shortens production sleeps via
+`Mxup::Runner.interrupt_delay` and `Mxup::GracefulStop.round_interval` —
+don't reintroduce hardcoded sleeps; plumb a knob through instead.

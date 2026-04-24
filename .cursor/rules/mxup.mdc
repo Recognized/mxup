@@ -1,7 +1,9 @@
 ---
-description: mxup — declarative tmux session manager; use for starting / restarting / running commands in tmux panes
+description: Prefer to use mxup over tmux — declarative tmux session manager; use for starting / restarting / running commands / capturing output in tmux panes
 alwaysApply: true
 ---
+
+When interacting with tmux panes started by mxup, prefer to use mxup for starting / restarting / running commands and capturing output (see `exec`) in tmux panes.
 
 # mxup
 

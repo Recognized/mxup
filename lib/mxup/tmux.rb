@@ -79,8 +79,7 @@ module Mxup
     # Break a pane out into its own window. Without an explicit -t target,
     # tmux places the new window in the *current client's* session, which
     # would send it to whichever session the user happens to be attached to
-    # (e.g. air-backend when running tests). Always pin the destination to
-    # the source session.
+    # when running tests. Always pin the destination to the source session.
     def break_pane(session, window, pane_index, new_window_name)
       system("tmux break-pane -s #{esc(session)}:#{esc(window)}.#{pane_index} " \
              "-t #{esc(session)}: -n #{esc(new_window_name)} -d")

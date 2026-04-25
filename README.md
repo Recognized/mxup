@@ -32,23 +32,23 @@ ln -sf ~/src/mxup/bin/mxup ~/.local/bin/mxup   # ensure ~/.local/bin is on PATH
 ```bash
 # Create a config
 mkdir -p ~/.config/mxup
-cp ~/IdeaProjects/mxup/examples/air-dev.yml ~/.config/mxup/
+cp ~/IdeaProjects/mxup/examples/myapp-dev.yml ~/.config/mxup/
 
 # Bring the session up (reconcile)
-mxup up air-dev
+mxup up myapp-dev
 
 # Check what's running
-mxup status air-dev
+mxup status myapp-dev
 
 # Restart specific windows
-mxup restart air-dev:air-backend
-mxup restart air-dev:air-backend,agent-spawner
+mxup restart myapp-dev:api
+mxup restart myapp-dev:api,worker
 
 # Restart all windows
-mxup restart air-dev
+mxup restart myapp-dev
 
 # Tear everything down
-mxup down air-dev
+mxup down myapp-dev
 ```
 
 ## Config format
@@ -314,8 +314,8 @@ graceful-stop dance), then brings the new profile up from a clean slate.
 for it to finish, and show the output" loop. It handles the three annoying
 parts for you:
 
-1. **Resolving logical names to real tmux targets** — `air-backend` may actually
-   live as pane `services.1`; `mxup exec -t air-dev:air-backend` figures that
+1. **Resolving logical names to real tmux targets** — `api` may actually
+   live as pane `services.1`; `mxup exec -t myapp-dev:api` figures that
    out via the active layout.
 2. **Waiting for the command to finish** — uses `tmux wait-for` with a unique
    marker under the hood, so `exec` blocks until the command actually exits.
@@ -326,16 +326,16 @@ So instead of the verbose recipe:
 
 ```bash
 MARKER="fulltest-$(date +%s%N)"
-tmux send-keys -t air-dev:scratch \
+tmux send-keys -t myapp-dev:scratch \
   "./gradlew test 2>&1 | tail -n 30; echo FULLTEST_EXIT=\$?; tmux wait-for -S $MARKER" Enter \
   && tmux wait-for $MARKER
-tmux capture-pane -t air-dev:scratch -p -S -50
+tmux capture-pane -t myapp-dev:scratch -p -S -50
 ```
 
 you write:
 
 ```bash
-mxup exec -t air-dev:scratch "./gradlew test 2>&1 | tail -n 30"
+mxup exec -t myapp-dev:scratch "./gradlew test 2>&1 | tail -n 30"
 echo "exit: $?"
 ```
 

@@ -1,0 +1,110 @@
+# Example: local development stack for a fictional app called "myapp"
+#
+# This is a showcase config — it exercises most mxup features (multiple
+# windows, wait_for probes, per-window env, alternative layouts, and
+# profiles that drop or override windows). Adapt the paths, commands,
+# and env vars to your own project.
+#
+# Place your copy at ~/.config/mxup/myapp-dev.yml, then:
+#   mxup up myapp-dev
+#   mxup status myapp-dev
+#   mxup restart myapp-dev:api
+#   mxup down myapp-dev
+#
+# Switch layouts:
+#   mxup layout myapp-dev compact
+#   mxup up myapp-dev --layout=flat
+#
+# Switch profiles (tears down the current profile first):
+#   mxup up myapp-dev --profile=local     # default, everything on localhost
+#   mxup up myapp-dev --profile=staging   # frontend only, talks to hosted API
+#
+# Parameterize via env vars:
+#   DOCKER_PROFILES=core mxup up myapp-dev
+
+session: myapp-dev
+
+setup: |
+  # Runs in every window before its command. Replace with whatever your
+  # project needs (direnv, nvm, asdf, sourcing a .env, etc.).
+  eval "$(direnv export zsh)"
+
+windows:
+  docker:
+    root: ~/code/myapp-infra
+    command: docker compose --profile ${DOCKER_PROFILES:-core} up
+
+  api:
+    root: ~/code/myapp/api
+    wait_for:
+      tcp: localhost:5432
+      timeout: 120
+    env:
+      APP_ENV: development
+      DATABASE_URL: postgres://localhost/myapp_dev
+    command: ./gradlew run
+
+  worker:
+    root: ~/code/myapp/worker
+    wait_for: localhost:6379          # shorthand for a tcp check (redis)
+    env:
+      APP_ENV: development
+      DATABASE_URL: postgres://localhost/myapp_dev
+      REDIS_URL: redis://localhost:6379
+    command: ./gradlew run
+
+  scheduler:
+    root: ~/code/myapp/scheduler
+    wait_for: localhost:5432
+    env:
+      APP_ENV: development
+      DATABASE_URL: postgres://localhost/myapp_dev
+    command: ./gradlew run
+
+  frontend:
+    root: ~/code/myapp/frontend
+    wait_for:
+      http: http://localhost:8080/health
+      timeout: 60
+    env:
+      API_URL: http://localhost:8080
+    command: pnpm run dev
+
+  storybook:
+    root: ~/code/myapp/frontend
+    command: pnpm run storybook
+
+  scratch:
+    # No `command` -> plain interactive shell, handy for ad-hoc work
+    # (e.g. `mxup exec -t myapp-dev:scratch "./gradlew test"`).
+    root: ~/code/myapp
+
+layouts:
+  full:
+    services:
+      panes: [docker, api, worker, scheduler]
+      split: main-vertical
+    frontend:
+      panes: [frontend, storybook]
+      split: even-horizontal
+
+  compact:
+    all:
+      panes: [docker, api, worker, scheduler, frontend, storybook]
+      split: tiled
+
+  flat: {}
+
+profiles:
+  # Everything runs locally via docker + ./gradlew run (the base config).
+  local: {}
+
+  # Staging: skip local backends, point the frontend at the hosted API.
+  staging:
+    windows:
+      api: ~
+      worker: ~
+      scheduler: ~
+      frontend:
+        env:
+          API_URL: https://api.staging.example.com

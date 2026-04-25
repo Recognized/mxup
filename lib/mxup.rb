@@ -21,8 +21,9 @@
 #   Runner                                   — facade delegating to the above
 #   CLI                                      — argv parsing + command dispatch
 
+require_relative 'mxup/version'
+
 module Mxup
-  VERSION      = '0.2.0'
   CONFIG_DIR   = File.expand_path('~/.config/mxup')
   RUNTIME_DIR  = File.expand_path('~/.local/share/mxup')
   SHELLS       = %w[zsh bash sh fish dash].freeze

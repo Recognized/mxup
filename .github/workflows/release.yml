@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  rubygems:
+    name: Publish to RubyGems
+    runs-on: ubuntu-latest
+
+    # Required for RubyGems trusted publishing (OIDC).
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Verify tag matches gem version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          gem_version=$(ruby -r ./lib/mxup/version -e 'print Mxup::VERSION')
+          if [ "$tag" != "$gem_version" ]; then
+            echo "::error::git tag v$tag does not match Mxup::VERSION ($gem_version)"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: bundle exec rake test
+
+      - name: Publish to RubyGems (trusted publishing)
+        uses: rubygems/release-gem@v1
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            pkg/*.gem
+
+  homebrew:
+    name: Bump Homebrew tap
+    needs: rubygems
+    runs-on: ubuntu-latest
+
+    # Skipped automatically when HOMEBREW_TAP_TOKEN is not set, so this is
+    # safe to keep disabled until the user creates a tap repo.
+    if: ${{ vars.HOMEBREW_TAP != '' }}
+
+    steps:
+      - name: Bump formula in tap
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: ${{ vars.HOMEBREW_TAP }}
+          formula: mxup
+          tag: ${{ github.ref_name }}
+          revision: ${{ github.sha }}
+          force: false

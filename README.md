@@ -6,14 +6,26 @@ Run `mxup up` any time — it creates what's missing, restarts what crashed, rem
 
 ## Install
 
-Requires tmux and Ruby (stdlib only, no gems).
+Requires `tmux` and Ruby 3.1+ (stdlib only — no runtime gem dependencies).
+
+### RubyGems
 
 ```bash
-git clone <repo-url> ~/IdeaProjects/mxup
-ln -sf ~/IdeaProjects/mxup/bin/mxup ~/.local/bin/mxup
+gem install mxup
 ```
 
-Make sure `~/.local/bin` is on your `PATH`.
+### Homebrew
+
+```bash
+brew install Recognized/mxup/mxup
+```
+
+### From source
+
+```bash
+git clone https://github.com/Recognized/mxup.git ~/src/mxup
+ln -sf ~/src/mxup/bin/mxup ~/.local/bin/mxup   # ensure ~/.local/bin is on PATH
+```
 
 ## Quick start
 
@@ -342,6 +354,41 @@ command (exits 124 on timeout).
 - **Idle/crashed windows** (shell prompt visible) → command re-sent
 - **Healthy running windows** → left untouched
 - **Layout changed** → panes rearranged without killing processes
+
+## Releasing
+
+Releases are automated by `.github/workflows/release.yml`. To cut a new version:
+
+1. Bump `Mxup::VERSION` in `lib/mxup/version.rb`.
+2. Commit and tag: `git commit -am "Release vX.Y.Z" && git tag vX.Y.Z`.
+3. `git push origin main --tags`.
+
+The workflow then runs the test suite, verifies the tag matches
+`Mxup::VERSION`, publishes the gem to RubyGems via [trusted publishing][tp]
+(OIDC — no API keys stored), creates a GitHub release with the built `.gem`
+attached, and — if a Homebrew tap is configured — opens a PR in the tap repo
+bumping the formula.
+
+### One-time setup
+
+**RubyGems trusted publishing.** Claim `mxup` on rubygems.org, then under
+_Settings → Trusted publishers_ add:
+
+- Repository: `Recognized/mxup`
+- Workflow: `release.yml`
+- Environment: _(leave blank)_
+
+**Homebrew tap (optional).** Create a `Recognized/homebrew-mxup` repo,
+copy `packaging/homebrew/mxup.rb` to `Formula/mxup.rb` in it, then in the
+`mxup` repo's settings add:
+
+- Variable `HOMEBREW_TAP` = `Recognized/homebrew-mxup`
+- Secret `HOMEBREW_TAP_TOKEN` = a PAT with `contents: write` on the tap repo
+
+The `homebrew` job in `release.yml` will then run automatically on every
+tag push and keep the formula in sync.
+
+[tp]: https://guides.rubygems.org/trusted-publishing/
 
 ## License
 

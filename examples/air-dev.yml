@@ -10,6 +10,10 @@
 #   mxup layout air-dev compact
 #   mxup up air-dev --layout=flat
 #
+# Switch profiles (tears down the current profile first):
+#   mxup up air-dev --profile=local     # default
+#   mxup up air-dev --profile=staging   # talks to hosted staging backend
+#
 # Parameterize via env vars:
 #   DOCKER_PROFILES=agentic-core DOCKER_LOCAL=air-backend mxup up air-dev
 
@@ -78,3 +82,15 @@ layouts:
       split: tiled
 
   flat: {}
+
+profiles:
+  # Everything runs locally via docker + ./gradlew run (the base config).
+  local: {}
+
+  staging:
+    windows:
+      air-backend: ~
+      agent-spawner: ~
+      ai-management: ~
+      dev-kit:
+        command: npx @jcp/platform-dev-kit --profile=staging,dev

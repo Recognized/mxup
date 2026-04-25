@@ -28,6 +28,7 @@ module Mxup
     # --- primary commands --------------------------------------------------
 
     def up
+      handle_profile_switch
       reconciler.up
     end
 
@@ -97,6 +98,30 @@ module Mxup
     end
 
     private
+
+    # --- profile switching -------------------------------------------------
+
+    # Before `up` runs, make sure we aren't stepping on a different profile
+    # of the same group. If the live session was brought up under a different
+    # profile, tear it down first so the new profile starts from a clean
+    # slate. Running profiles are expected to be mutually exclusive.
+    def handle_profile_switch
+      return unless @config.profile
+      return unless Tmux.has_session?(@session)
+
+      stored = Tmux.show_environment(@session, 'MXUP_PROFILE')
+      return if stored.nil? || stored == @config.profile
+
+      if @dry_run
+        $stdout.puts "[dry-run] Would tear down profile '#{stored}' before " \
+                     "bringing up '#{@config.profile}'"
+        return
+      end
+
+      $stdout.puts "Switching profile: '#{stored}' -> '#{@config.profile}' " \
+                   '(tearing down current profile first)...'
+      down
+    end
 
     # --- restart helpers ---------------------------------------------------
 

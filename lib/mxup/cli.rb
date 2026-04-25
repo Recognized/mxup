@@ -19,7 +19,8 @@ module Mxup
     def parse(args)
       options = {
         dry_run: false, config: nil, lines: nil, layout: nil,
-        target: nil,    timeout: nil, force: false, quiet: false
+        target: nil,    timeout: nil, force: false, quiet: false,
+        profile: nil
       }
 
       parser = OptionParser.new do |opts|
@@ -28,6 +29,8 @@ module Mxup
         opts.on('--dry-run', 'Preview changes without applying')      { options[:dry_run] = true }
         opts.on('--lines N', Integer, 'Output lines (status/exec)')   { |n| options[:lines]   = n }
         opts.on('--layout NAME', 'Layout to use (for up/layout)')     { |l| options[:layout]  = l }
+        opts.on('-p', '--profile NAME',
+                'Profile to use (for up/status/restart/layout)')      { |p| options[:profile] = p }
         opts.on('-t', '--target TARGET',
                 'Target window/pane for exec (e.g. name:window)')     { |t| options[:target]  = t }
         opts.on('--timeout N', Integer, 'Timeout in seconds (exec)')  { |n| options[:timeout] = n }
@@ -128,14 +131,16 @@ module Mxup
     end
 
     def build_runner(options, name)
-      config = load_config(options[:config], name)
+      config = load_config(options[:config], name, options[:profile])
       Runner.new(config, dry_run: options[:dry_run], layout: options[:layout])
     end
 
-    def load_config(explicit_path, name)
+    def load_config(explicit_path, name, profile = nil)
       path = resolve_config(explicit_path, name)
       abort "Config not found. Provide -f path or place config in #{CONFIG_DIR}/" unless path
-      Config.new(path)
+      Config.new(path, profile: profile)
+    rescue ArgumentError => e
+      abort e.message
     end
 
     # Config resolution order:

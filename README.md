@@ -194,6 +194,79 @@ Switch layouts on a running session without killing processes:
 mxup layout my-project compact
 ```
 
+### Profiles
+
+A single project often needs to run under different stacks — "local
+everything", "staging backend with local frontend", etc. Profiles express
+those variants as a set of overrides on top of a shared base. Only one
+profile of a given config may be live at a time; `mxup up` of a different
+profile automatically tears the current one down first.
+
+```yaml
+session: my-project
+
+windows:
+  backend:
+    root: ~/projects/my-app/backend
+    command: ./start-server.sh
+    env:
+      DATABASE_URL: postgres://localhost/myapp_dev
+
+  frontend:
+    root: ~/projects/my-app/frontend
+    command: npm run dev
+
+profiles:
+  local: {}                      # uses the base as-is
+
+  staging:
+    windows:
+      backend:
+        command: ./connect-staging.sh
+        env:
+          DATABASE_URL: postgres://staging-db/myapp
+```
+
+Pick a profile with `--profile` (short: `-p`):
+
+```bash
+mxup up my-project --profile=local
+mxup up my-project -p staging     # tears down 'local' first
+mxup status my-project            # shows "profile: staging" in the header
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `profiles` | no | Map of profile name → override block |
+| `default_profile` | no | Profile to use when `--profile` is omitted (defaults to the first declared) |
+
+**Override semantics**: the active profile's `setup`, `windows`, and
+`layouts` override the base. Window overrides are merged per-key (so you
+can tweak just `command` or `env` without redeclaring `root`). `env` maps
+are themselves merged — keys not in the profile are inherited from the
+base. A profile may not override `session`; profiles of the same group
+must share one tmux session.
+
+**Dropping windows**: to exclude a base window from a profile, map it to
+`~` (YAML null):
+
+```yaml
+profiles:
+  minimal:
+    windows:
+      dev-kit: ~         # don't start dev-kit under the `minimal` profile
+      scratch: ~
+```
+
+Any layout groups that reference a dropped window are automatically
+pruned — entries are stripped from `panes:` lists, and a group that ends
+up empty is removed from its layout.
+
+**Switching**: if the tmux session is already running under a different
+profile, `mxup up` for a new profile runs `down` first (including the
+graceful-stop dance), then brings the new profile up from a clean slate.
+`mxup status` always shows the currently live profile in its header.
+
 ## Commands
 
 | Command | Description |
@@ -217,6 +290,7 @@ mxup layout my-project compact
 | `--dry-run` | Preview changes without applying (for `up`, `restart`, `exec`) |
 | `--lines N` | Output lines to show (for `status` default 15, for `exec` default 50) |
 | `--layout NAME` | Layout to use (for `up`) |
+| `-p`, `--profile NAME` | Profile to use; auto-teardowns a live session running under a different profile (for `up`, `status`, `restart`) |
 | `-t TARGET` | Pane target (for `exec`); accepts `name:window`, `window`, or `window.pane` |
 | `--timeout N` | Max seconds to wait for the command (for `exec`; exit 124 on timeout) |
 | `--force` | Send the command even if the pane is busy with another process (for `exec`) |

@@ -210,6 +210,203 @@ class ConfigTest < Minitest::Test
 end
 
 # ---------------------------------------------------------------------------
+# Config — profiles
+# ---------------------------------------------------------------------------
+
+class ConfigProfilesTest < Minitest::Test
+  include TestHelpers::TmpDir
+
+  def base_yaml(extra = '')
+    <<~YAML
+      session: s
+      windows:
+        w:
+          root: /tmp
+          command: base-cmd
+          env:
+            FOO: base-foo
+            BAR: base-bar
+      #{extra}
+    YAML
+  end
+
+  def profiled_yaml(profile: nil, extra_profiles: '')
+    make_config(<<~YAML, profile: profile)
+      session: s
+      windows:
+        w:
+          root: /tmp
+          command: base-cmd
+          env:
+            FOO: base-foo
+            BAR: base-bar
+      profiles:
+        local:
+          windows:
+            w:
+              env:
+                FOO: local-foo
+        staging:
+          windows:
+            w:
+              command: staging-cmd
+              env:
+                EXTRA: staging-extra
+      #{extra_profiles}
+    YAML
+  end
+
+  def make_config(yaml, profile: nil)
+    Mxup::Config.new(write_yaml(yaml), profile: profile)
+  end
+
+  def test_no_profiles_section_means_no_profile
+    config = make_config(base_yaml)
+    assert_nil           config.profile
+    assert_equal [],     config.profile_names
+    assert_equal 'base-cmd',   config.windows.first.command
+    assert_equal 'base-foo',   config.windows.first.env['FOO']
+  end
+
+  def test_passing_profile_without_profiles_block_raises
+    assert_raises(ArgumentError) { make_config(base_yaml, profile: 'local') }
+  end
+
+  def test_default_profile_is_first_declared
+    config = profiled_yaml
+    assert_equal 'local', config.profile
+    assert_equal %w[local staging], config.profile_names
+    assert_equal 'local', config.default_profile
+  end
+
+  def test_explicit_default_profile_wins_over_first
+    config = make_config(<<~YAML)
+      session: s
+      default_profile: staging
+      windows:
+        w: { root: /tmp, command: base }
+      profiles:
+        local:  {}
+        staging: {}
+    YAML
+    assert_equal 'staging', config.default_profile
+    assert_equal 'staging', config.profile
+  end
+
+  def test_unknown_profile_raises
+    assert_raises(ArgumentError) { profiled_yaml(profile: 'ghost') }
+  end
+
+  def test_profile_overrides_env_and_preserves_untouched_keys
+    win = profiled_yaml(profile: 'local').windows.first
+    assert_equal 'local-foo', win.env['FOO'], 'overridden by profile'
+    assert_equal 'base-bar',  win.env['BAR'], 'inherited from base'
+    assert_equal 'base-cmd',  win.command,    'untouched by profile'
+  end
+
+  def test_profile_overrides_command_and_adds_env
+    win = profiled_yaml(profile: 'staging').windows.first
+    assert_equal 'staging-cmd',   win.command
+    assert_equal 'base-foo',      win.env['FOO']
+    assert_equal 'staging-extra', win.env['EXTRA']
+  end
+
+  def test_profile_overriding_session_raises
+    assert_raises(ArgumentError) do
+      make_config(<<~YAML, profile: 'local')
+        session: s
+        windows:
+          w: { root: /tmp }
+        profiles:
+          local:
+            session: forbidden
+      YAML
+    end
+  end
+
+  def test_profile_can_drop_a_base_window_with_null
+    config = make_config(<<~YAML, profile: 'minimal')
+      session: s
+      windows:
+        keep: { root: /tmp, command: echo keep }
+        drop: { root: /tmp, command: echo drop }
+      profiles:
+        minimal:
+          windows:
+            drop: ~
+    YAML
+
+    assert_equal %w[keep], config.windows.map(&:name)
+    assert_nil             config.window_by_name('drop')
+  end
+
+  def test_profile_drop_also_prunes_layout_groups
+    config = make_config(<<~YAML, profile: 'no-frontend')
+      session: s
+      windows:
+        api:      { root: /tmp, command: sleep 1 }
+        web:      { root: /tmp, command: sleep 1 }
+        dev-kit:  { root: /tmp, command: sleep 1 }
+      layouts:
+        full:
+          services: { panes: [api] }
+          frontend: { panes: [web, dev-kit] }
+      profiles:
+        no-frontend:
+          windows:
+            web:     ~
+            dev-kit: ~
+    YAML
+
+    assert_equal %w[api],      config.windows.map(&:name)
+    group_names = config.groups_for('full').map(&:name)
+    assert_equal %w[services], group_names,
+                 'empty group should be pruned entirely'
+  end
+
+  def test_profile_drop_shrinks_but_keeps_partially_surviving_group
+    config = make_config(<<~YAML, profile: 'slim')
+      session: s
+      windows:
+        a: { root: /tmp }
+        b: { root: /tmp }
+        c: { root: /tmp }
+      layouts:
+        full:
+          grp: { panes: [a, b, c] }
+      profiles:
+        slim:
+          windows:
+            b: ~
+    YAML
+
+    group = config.groups_for('full').first
+    assert_equal 'grp',    group.name
+    assert_equal %w[a c],  group.window_names
+  end
+
+  def test_profile_can_replace_layouts_entirely
+    config = make_config(<<~YAML, profile: 'flat')
+      session: s
+      windows:
+        a: { root: /tmp }
+        b: { root: /tmp }
+      layouts:
+        full:
+          pair: { panes: [a, b] }
+      profiles:
+        flat:
+          layouts:
+            solo:
+              one: { panes: [a] }
+    YAML
+    assert_equal %w[solo],                config.layout_names
+    assert_equal 'solo',                  config.default_layout
+    assert_equal %w[a],                   config.groups_for('solo').first.window_names
+  end
+end
+
+# ---------------------------------------------------------------------------
 # Config — layouts & derived views
 # ---------------------------------------------------------------------------
 
@@ -816,14 +1013,15 @@ class StatusViewTest < Minitest::Test
     Mxup::Runner.new(config, layout: layout)
   end
 
-  def stub_running(panes:, windows: nil, layout: nil, capture: '')
+  def stub_running(panes:, windows: nil, layout: nil, profile: nil, capture: '')
     wins = windows || panes.map { |p| window(name: p[:name], index: p[:window_index]) }.uniq
+    env = { 'MXUP_LAYOUT' => layout, 'MXUP_PROFILE' => profile }
     stub_tmux(
       has_session?: true,
       session_created: Time.now.to_i.to_s,
       list_panes: panes,
       list_windows: wins,
-      show_environment: layout,
+      show_environment: ->(_session, key) { env[key] },
       capture_pane: capture
     )
   end
@@ -928,6 +1126,33 @@ class StatusViewTest < Minitest::Test
     assert_match(/^\s*beta:\s*$/,  out)
   end
 
+  def test_shows_active_profile_in_header
+    stub_running(
+      layout: 'full', profile: 'local',
+      panes: [pane(name: 'w', fg_cmd: 'sleep')]
+    )
+
+    runner = runner_for(<<~YAML)
+      windows:
+        w: { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          main: { panes: [w] }
+    YAML
+
+    out, = capture_io { runner.status(lines: 2) }
+    assert_includes out, 'profile: local'
+    assert_includes out, 'layout: full'
+  end
+
+  def test_header_omits_profile_when_none_stored
+    stub_running(panes: [pane(name: 'w', fg_cmd: 'sleep')])
+    runner = runner_for("windows:\n  w: { root: /tmp }\n")
+
+    out, = capture_io { runner.status(lines: 2) }
+    refute_includes out, 'profile:'
+  end
+
   def test_surfaces_content_that_scrolled_past_the_lines_window
     # capture_pane returns a big scroll with the marker buried; StatusView
     # filters blanks then tails, so as long as the marker lives in a
@@ -1017,5 +1242,66 @@ class RunnerDownTest < Minitest::Test
 
     out, = capture_io { runner.down }
     assert_includes out, 'not running'
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Runner#up — profile switch detection (dry-run path, no real tmux)
+# ---------------------------------------------------------------------------
+
+class RunnerProfileSwitchTest < Minitest::Test
+  include TestHelpers::TmpDir
+  include TestHelpers::TmuxStubs
+
+  PROFILED_YAML = <<~YAML.freeze
+    session: s
+    windows:
+      w:
+        root: /tmp
+        command: base
+    profiles:
+      local:   {}
+      staging: {}
+  YAML
+
+  def config_for(profile)
+    Mxup::Config.new(write_yaml(PROFILED_YAML), profile: profile)
+  end
+
+  def test_announces_profile_switch_when_different_profile_is_live
+    stub_tmux(
+      has_session?: true,
+      show_environment: ->(_s, key) { key == 'MXUP_PROFILE' ? 'staging' : nil },
+      list_panes: [], list_windows: [], session_created: Time.now.to_i.to_s
+    )
+
+    runner = Mxup::Runner.new(config_for('local'), dry_run: true)
+    out, = capture_io { runner.up }
+
+    assert_includes out,
+                    "[dry-run] Would tear down profile 'staging' before " \
+                    "bringing up 'local'"
+  end
+
+  def test_no_switch_message_when_same_profile_is_live
+    stub_tmux(
+      has_session?: true,
+      show_environment: ->(_s, key) { key == 'MXUP_PROFILE' ? 'local' : nil },
+      list_panes: [], list_windows: [], session_created: Time.now.to_i.to_s
+    )
+
+    runner = Mxup::Runner.new(config_for('local'), dry_run: true)
+    out, = capture_io { runner.up }
+
+    refute_includes out, 'Switching profile'
+  end
+
+  def test_no_switch_when_session_not_running
+    stub_tmux(has_session?: false)
+
+    runner = Mxup::Runner.new(config_for('local'), dry_run: true)
+    out, = capture_io { runner.up }
+
+    refute_includes out, 'Switching profile'
   end
 end

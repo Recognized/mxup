@@ -127,9 +127,9 @@ module IntegrationHelpers
   # Write a YAML config that always uses the per-test session name and
   # return a ready-to-use [config, runner] pair. The YAML should omit the
   # top-level `session:` line; we prepend it automatically.
-  def make_runner(yaml, dry_run: false, layout: nil)
+  def make_runner(yaml, dry_run: false, layout: nil, profile: nil)
     body = "session: #{@session}\n#{yaml}"
-    config = Mxup::Config.new(write_yaml(body))
+    config = Mxup::Config.new(write_yaml(body), profile: profile)
     [config, Mxup::Runner.new(config, dry_run: dry_run, layout: layout)]
   end
 
@@ -820,5 +820,172 @@ class ExecTest < Minitest::Test
 
     _out, _err, status = exec!(runner, 'scratch', 'sleep 30', timeout: 1)
     assert_equal 124, status
+  end
+end
+
+# ===========================================================================
+# Profiles — mutually exclusive stack configs under one session name
+# ===========================================================================
+
+class ProfilesTest < Minitest::Test
+  include IntegrationHelpers
+
+  PROFILED_YAML = <<~YAML.freeze
+    windows:
+      w:
+        root: /tmp
+        command: sleep 600
+    profiles:
+      local:
+        windows:
+          w: { env: { MODE: local } }
+      staging:
+        windows:
+          w: { env: { MODE: staging } }
+  YAML
+
+  def test_active_profile_is_stored_in_tmux_environment
+    _, runner = make_runner(PROFILED_YAML, profile: 'local')
+    up!(runner)
+
+    assert_equal 'local', Mxup::Tmux.show_environment(session, 'MXUP_PROFILE')
+  end
+
+  def test_status_header_surfaces_the_active_profile
+    _, runner = make_runner(PROFILED_YAML, profile: 'staging')
+    up!(runner)
+    wait_for_fg('w', 'sleep')
+
+    out, = status!(runner)
+    assert_includes out, 'profile: staging'
+  end
+
+  def test_switching_profile_tears_down_previous_and_brings_up_new
+    _, local = make_runner(PROFILED_YAML, profile: 'local')
+    up!(local)
+    wait_for_fg('w', 'sleep')
+    pid_local = Mxup::Tmux.list_panes(session).first[:pid]
+
+    _, staging = make_runner(PROFILED_YAML, profile: 'staging')
+    out, = up!(staging)
+
+    assert_includes out, "Switching profile: 'local' -> 'staging'"
+    assert_equal 'staging', Mxup::Tmux.show_environment(session, 'MXUP_PROFILE')
+
+    wait_for_fg('w', 'sleep')
+    pid_staging = Mxup::Tmux.list_panes(session).first[:pid]
+    refute_equal pid_local, pid_staging,
+                 'profile switch should have created a new pane process'
+  end
+
+  def test_switching_profile_drops_windows_that_are_not_in_new_profile
+    yaml = <<~YAML
+      windows:
+        shared: { root: /tmp, command: sleep 600 }
+        only-local:   { root: /tmp, command: sleep 600 }
+        only-staging: { root: /tmp, command: sleep 600 }
+      profiles:
+        local:
+          windows:
+            only-staging: ~
+        staging:
+          windows:
+            only-local: ~
+    YAML
+
+    _, local = make_runner(yaml, profile: 'local')
+    up!(local)
+    wait_for_fg('shared',      'sleep')
+    wait_for_fg('only-local',  'sleep')
+
+    assert_equal %w[shared only-local].sort, window_names.sort,
+                 'local profile should not have started only-staging'
+
+    _, staging = make_runner(yaml, profile: 'staging')
+    up!(staging)
+    wait_for_fg('shared',        'sleep')
+    wait_for_fg('only-staging',  'sleep')
+
+    assert_equal %w[shared only-staging].sort, window_names.sort,
+                 "only-local should be gone after switching to 'staging'"
+  end
+
+  def test_switching_profile_drops_empty_pane_groups
+    yaml = <<~YAML
+      windows:
+        shared:   { root: /tmp, command: sleep 600 }
+        back-a:   { root: /tmp, command: sleep 600 }
+        back-b:   { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          services: { panes: [back-a, back-b], split: even-horizontal }
+          misc:     { panes: [shared] }
+      profiles:
+        full:   {}
+        no-backend:
+          windows:
+            back-a: ~
+            back-b: ~
+    YAML
+
+    _, full = make_runner(yaml, profile: 'full')
+    up!(full)
+    wait_for_fg('services', 'sleep', pane_index: 0)
+    wait_for_fg('services', 'sleep', pane_index: 1)
+    wait_for_fg('misc',     'sleep')
+
+    assert_equal %w[misc services].sort, window_names.sort
+
+    _, no_backend = make_runner(yaml, profile: 'no-backend')
+    up!(no_backend)
+    wait_for_fg('misc', 'sleep')
+
+    assert_equal %w[misc], window_names,
+                 "'services' tmux window should be gone after dropping all its declared panes"
+  end
+
+  def test_switching_profile_shrinks_pane_group_when_some_panes_dropped
+    yaml = <<~YAML
+      windows:
+        api:     { root: /tmp, command: sleep 600 }
+        worker:  { root: /tmp, command: sleep 600 }
+        admin:   { root: /tmp, command: sleep 600 }
+      layouts:
+        full:
+          services: { panes: [api, worker, admin], split: tiled }
+      profiles:
+        full:   {}
+        api-only:
+          windows:
+            worker: ~
+            admin:  ~
+    YAML
+
+    _, full = make_runner(yaml, profile: 'full')
+    up!(full)
+    3.times { |i| wait_for_fg('services', 'sleep', pane_index: i) }
+
+    assert_equal 3, Mxup::Tmux.pane_count(session, 'services')
+
+    _, slim = make_runner(yaml, profile: 'api-only')
+    up!(slim)
+    wait_for_fg('services', 'sleep', pane_index: 0)
+
+    assert_equal 1, Mxup::Tmux.pane_count(session, 'services'),
+                 "'services' should have shrunk to only 'api' after dropping two panes"
+  end
+
+  def test_re_upping_same_profile_does_not_tear_down
+    _, runner = make_runner(PROFILED_YAML, profile: 'local')
+    up!(runner)
+    wait_for_fg('w', 'sleep')
+    pid_before = Mxup::Tmux.list_panes(session).first[:pid]
+
+    out, = up!(runner)
+    refute_includes out, 'Switching profile'
+
+    pid_after = Mxup::Tmux.list_panes(session).first[:pid]
+    assert_equal pid_before, pid_after,
+                 're-up of the same profile should not restart panes'
   end
 end

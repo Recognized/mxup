@@ -64,6 +64,7 @@ module Mxup
       order.drop(1).each { |entry| create_entry(entry) }
 
       Tmux.set_environment(@session, 'MXUP_LAYOUT', layout) if layout
+      Tmux.set_environment(@session, 'MXUP_PROFILE', @config.profile) if @config.profile
       out.puts "Session #{@session} is up (#{@config.windows.size} windows)."
     end
 
@@ -112,6 +113,7 @@ module Mxup
 
       @layout_manager.reorder(layout) unless @dry_run
       Tmux.set_environment(@session, 'MXUP_LAYOUT', layout) if layout && !@dry_run
+      Tmux.set_environment(@session, 'MXUP_PROFILE', @config.profile) if @config.profile && !@dry_run
       out.puts 'Reconciliation complete.'
     end
 

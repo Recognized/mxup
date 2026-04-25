@@ -29,7 +29,9 @@ mxup exec -t <target> "<cmd>"      # run + wait + capture output + exit rc
 ```
 
 Flags: `-f <path>` (explicit config), `--dry-run`, `--layout NAME` (for
-`up`), `--timeout N` + `--force` + `-q` (for `exec`).
+`up`), `-p`/`--profile NAME` (for `up`/`status`/`restart`; auto-tears down
+a live session running under a different profile),
+`--timeout N` + `--force` + `-q` (for `exec`).
 
 ## Prefer `mxup exec` for running commands in a pane
 
@@ -68,11 +70,25 @@ layouts:                            # optional; first is default, override with 
   full:
     services: { panes: [db, backend], split: even-horizontal }
   flat: {}                          # empty → all windows standalone
+
+profiles:                           # optional; mutually-exclusive variants of the same session
+  local: {}
+  staging:                          # per-key overrides on the base windows/setup/layouts
+    windows:
+      backend:
+        command: ./connect-staging.sh
+        env: { DATABASE_URL: postgres://staging-db/myapp }   # merges into base env
+      dev-kit: ~                    # null drops the window from this profile
 ```
 
 Window fields: `root` (required, supports `~`), `command`, `env`,
 `wait_for`. Expanded `wait_for` forms accept `timeout` + `interval` +
 `label`.
+
+Profile rules: only one profile of a group may be live; `mxup up -p X`
+while profile Y is running triggers a `down` of Y first. Profiles share
+the top-level `session` name; overriding `session` from a profile is an
+error. `mxup status` shows the active profile in the header.
 
 ## When editing a consumer's mxup config
 

@@ -28,8 +28,12 @@ module Mxup
       active       = @resolver.active_layout
       created      = Tmux.session_created(@session)
       created_at   = Time.at(created.to_i).strftime('%Y-%m-%d %H:%M:%S')
-      layout_info  = active ? " (layout: #{active})" : ''
-      out.puts "SESSION: #{@session} — up since #{created_at}#{layout_info}"
+      stored_prof  = Tmux.show_environment(@session, 'MXUP_PROFILE')
+      bits         = []
+      bits << "profile: #{stored_prof}"       if stored_prof
+      bits << "layout: #{active}"             if active
+      suffix       = bits.empty? ? '' : " (#{bits.join(', ')})"
+      out.puts "SESSION: #{@session} — up since #{created_at}#{suffix}"
       out.puts
 
       panes           = Tmux.list_panes(@session)
